@@ -69,6 +69,18 @@ public final class MatchingEngine {
     return Optional.of(new OrderView(r.order.id(), r.order.side(), r.order.price(), r.remaining));
   }
   public List<Trade> trades() { return List.copyOf(history); }
+
+  /**
+   * Restore trade history from persistent storage (e.g., on restart recovery).
+   * Should be called once during engine initialization before any submit/cancel.
+   */
+  public void restoreTradeHistory(List<Trade> trades) {
+    if (!this.history.isEmpty()) {
+      throw new IllegalStateException("Cannot restore trade history: engine already has trades");
+    }
+    this.history.addAll(trades);
+  }
+
   public Optional<OrderView> find(long orderId) {
     Resting r = live.get(orderId);
     return r == null ? Optional.empty() : Optional.of(new OrderView(r.order.id(), r.order.side(), r.order.price(), r.remaining));
