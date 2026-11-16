@@ -41,6 +41,9 @@ public interface CommandRepository {
      */
     List<CommandRecord> findPendingCommandsSince(String symbol, long lastCompletedSequenceId);
 
+    /** Number of commands not yet completed for this instrument (for admission backpressure). */
+    long countOutstanding(String symbol);
+
     /**
      * Mark a command as COMPLETED with timestamp.
      */

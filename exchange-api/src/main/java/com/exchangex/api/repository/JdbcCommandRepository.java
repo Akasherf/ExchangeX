@@ -81,7 +81,7 @@ public class JdbcCommandRepository implements CommandRepository {
         String sql = """
             SELECT sequence_id, command_type, order_id, symbol, side, price, quantity, status
             FROM exchange_commands
-            WHERE order_id = ? AND symbol = ? AND command_type = 'CANCEL' AND status = 'PENDING'
+            WHERE order_id = ? AND symbol = ? AND command_type = 'CANCEL' AND status IN ('PENDING', 'FAILED')
             """;
         List<CommandRecord> results = jdbcTemplate.query(sql, COMMAND_MAPPER, clientOrderId, symbol);
         return results.isEmpty() ? Optional.empty() : Optional.of(results.get(0));
@@ -96,6 +96,14 @@ public class JdbcCommandRepository implements CommandRepository {
             ORDER BY sequence_id
             """;
         return jdbcTemplate.query(sql, COMMAND_MAPPER, symbol, lastCompletedSequenceId);
+    }
+
+    @Override
+    public long countOutstanding(String symbol) {
+        Long count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM exchange_commands WHERE symbol = ? AND status IN ('PENDING', 'FAILED')",
+                Long.class, symbol);
+        return count == null ? 0L : count;
     }
 
     @Override
