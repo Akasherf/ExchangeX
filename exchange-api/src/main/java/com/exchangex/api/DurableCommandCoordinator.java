@@ -11,8 +11,10 @@ import com.exchangex.engine.Side;
 import com.exchangex.engine.Trade;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.lang.Nullable;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import jakarta.annotation.PostConstruct;
@@ -62,7 +64,15 @@ public class DurableCommandCoordinator implements AutoCloseable {
     private final JdbcTemplate jdbcTemplate;
     private final TransactionTemplate transactionTemplate;
 
-    private final ExecutorService executor;
+    // Test-only failure injection seam (package-private, null in production)
+    @Nullable
+    private final FailureInjection failureInjection;
+
+    // Allow disabling auto-initialization for tests (default true for production)
+    @Value("${coordinator.auto-initialize:true}")
+    private boolean autoInitialize;
+
+    private ExecutorService executor;
     private final BlockingQueue<CommandTask> commandQueue;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong lastCommittedSequenceId = new AtomicLong(0);
@@ -71,8 +81,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
 
     // Dedicated scheduler for execution future polling
-    private final ScheduledExecutorService pollingScheduler =
-        Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "execution-future-poller-" + symbol));
+    private ScheduledExecutorService pollingScheduler;
 
     public DurableCommandCoordinator(
             MatchingEngine matchingEngine,
@@ -83,6 +92,24 @@ public class DurableCommandCoordinator implements AutoCloseable {
             JdbcTemplate jdbcTemplate,
             TransactionTemplate transactionTemplate
     ) {
+        this(matchingEngine, commandRepository, orderRepository, tradeRepository, checkpointRepository,
+             jdbcTemplate, transactionTemplate, null);
+    }
+
+    /**
+     * Package-private constructor for test configuration with failure injection.
+     * Only used by test configurations in postgres-integration profile.
+     */
+    DurableCommandCoordinator(
+            MatchingEngine matchingEngine,
+            CommandRepository commandRepository,
+            OrderRepository orderRepository,
+            TradeRepository tradeRepository,
+            CheckpointRepository checkpointRepository,
+            JdbcTemplate jdbcTemplate,
+            TransactionTemplate transactionTemplate,
+            @Nullable FailureInjection failureInjection
+    ) {
         this.matchingEngine = matchingEngine;
         this.commandRepository = commandRepository;
         this.orderRepository = orderRepository;
@@ -90,18 +117,87 @@ public class DurableCommandCoordinator implements AutoCloseable {
         this.checkpointRepository = checkpointRepository;
         this.jdbcTemplate = jdbcTemplate;
         this.transactionTemplate = transactionTemplate;
+        this.failureInjection = failureInjection;
 
-        this.commandQueue = new ArrayBlockingQueue<>(1024);
+        // Only create executor/scheduler for production mode (when repositories are provided)
+        // TestDurableCommandCoordinator passes null repositories and overrides initialize/close
+        boolean isProductionMode = commandRepository != null;
+        if (isProductionMode) {
+            this.commandQueue = new ArrayBlockingQueue<>(1024);
+            this.executor = new ThreadPoolExecutor(
+                    1, 1, 0L, TimeUnit.MILLISECONDS,
+                    new ArrayBlockingQueue<>(1024),
+                    r -> new Thread(r, "durable-coordinator-" + symbol),
+                    new ThreadPoolExecutor.AbortPolicy()
+            );
+            this.pollingScheduler = Executors.newSingleThreadScheduledExecutor(
+                    r -> new Thread(r, "execution-future-poller-" + symbol)
+            );
+        } else {
+            this.commandQueue = null;
+            this.executor = null;
+            this.pollingScheduler = null;
+        }
+    }
+
+    /**
+     * Spring-managed startup hook. Integration tests can suppress automatic replay
+     * until the dedicated test database has been cleaned.
+     */
+    @PostConstruct
+    void autoInitializeOnStartup() {
+        if (autoInitialize) {
+            initialize();
+        } else {
+            log.info("Auto-initialize disabled for {}", symbol);
+        }
+    }
+
+    /**
+     * Explicitly start or recover this coordinator. Unlike the Spring startup
+     * hook, this method must also work on manually constructed coordinators
+     * used to simulate a fresh process during recovery tests.
+     */
+    public void initialize() {
+        initializeInternal();
+    }
+
+    /**
+     * Reinitialize the coordinator from the current database state.
+     * Used by tests to sync in-memory state after database cleanup.
+     */
+    public void reinitialize() {
+        log.info("Reinitializing coordinator for {}", symbol);
+        // Stop current background worker
+        running.set(false);
+        try {
+            if (!shutdownLatch.await(5, TimeUnit.SECONDS)) {
+                log.warn("Background worker did not stop in time, forcing shutdown");
+                executor.shutdownNow();
+                pollingScheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            executor.shutdownNow();
+            pollingScheduler.shutdownNow();
+        }
+
+        // Create new executor and scheduler
         this.executor = new ThreadPoolExecutor(
                 1, 1, 0L, TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<>(1024), // executor's internal queue
+                new ArrayBlockingQueue<>(1024),
                 r -> new Thread(r, "durable-coordinator-" + symbol),
                 new ThreadPoolExecutor.AbortPolicy()
         );
+        this.pollingScheduler = Executors.newSingleThreadScheduledExecutor(
+                r -> new Thread(r, "execution-future-poller-" + symbol)
+        );
+
+        // Reinitialize from database
+        initializeInternal();
     }
 
-    @PostConstruct
-    public void initialize() {
+    private void initializeInternal() {
         // 1. Read checkpoint
         long checkpoint = checkpointRepository.getLastCompletedSequenceId(symbol);
         lastCommittedSequenceId.set(checkpoint);
@@ -162,7 +258,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
 
     /**
      * Replay commands that were committed to journal but not yet processed.
-     * These are commands with sequence_id > checkpoint and status = PENDING.
+     * These are commands with sequence_id > checkpoint and status PENDING or FAILED.
      */
     private void replayPendingCommands(long checkpoint) {
         List<CommandRepository.CommandRecord> pendingCommands =
@@ -238,8 +334,8 @@ public class DurableCommandCoordinator implements AutoCloseable {
         } catch (Exception e) {
             // A committed admission must never be silently discarded after a transient failure.
             // PostgreSQL rolled back the results; the in-memory engine did not.
-            // Stop processing and rely on restart recovery to replay the still-PENDING command.
-            log.error("Execution/commit failed for sequence {}. Halting coordinator; command remains PENDING for restart replay.", cmd.sequenceId(), e);
+            // Stop processing and rely on restart recovery to replay this journaled command.
+            log.error("Execution/commit failed for sequence {}. Halting coordinator; marking command FAILED for restart replay.", cmd.sequenceId(), e);
             // Mark command as FAILED so restart can distinguish from never-processed
             try {
                 commandRepository.markFailed(cmd.sequenceId());
@@ -365,6 +461,11 @@ public class DurableCommandCoordinator implements AutoCloseable {
                 }
             }
 
+            // Failure injection point 1: After orders, before trades
+            if (failureInjection != null) {
+                failureInjection.afterOrdersBeforeTrades(sequenceId);
+            }
+
             // 2. Insert trades with sequence references (after orders exist)
             if (!trades.isEmpty()) {
                 List<TradeRepository.TradeRecord> tradeRecords = new ArrayList<>();
@@ -382,8 +483,18 @@ public class DurableCommandCoordinator implements AutoCloseable {
                 tradeRepository.insertTrades(tradeRecords);
             }
 
+            // Failure injection point 2: After trades, before command status
+            if (failureInjection != null) {
+                failureInjection.afterTradesBeforeCommandStatus(sequenceId);
+            }
+
             // 3. Mark command as completed
             commandRepository.markCompleted(sequenceId);
+
+            // Failure injection point 3: After command status, before checkpoint
+            if (failureInjection != null) {
+                failureInjection.afterCommandStatusBeforeCheckpoint(sequenceId);
+            }
 
             // 4. Advance checkpoint
             checkpointRepository.advanceIfGreater(symbol, sequenceId);

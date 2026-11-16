@@ -92,7 +92,7 @@ public class JdbcCommandRepository implements CommandRepository {
         String sql = """
             SELECT sequence_id, command_type, order_id, symbol, side, price, quantity, status
             FROM exchange_commands
-            WHERE symbol = ? AND sequence_id > ? AND status = 'PENDING'
+            WHERE symbol = ? AND sequence_id > ? AND status IN ('PENDING', 'FAILED')
             ORDER BY sequence_id
             """;
         return jdbcTemplate.query(sql, COMMAND_MAPPER, symbol, lastCompletedSequenceId);
