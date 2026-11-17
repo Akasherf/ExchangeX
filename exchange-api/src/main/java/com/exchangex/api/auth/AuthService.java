@@ -1,6 +1,8 @@
 package com.exchangex.api.auth;
 
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import com.exchangex.api.accounts.AccountLedger;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -16,20 +18,26 @@ public class AuthService {
     private final ExchangeUserRepository users;
     private final PasswordEncoder passwordEncoder;
     private final JwtTokenService tokens;
+    private final AccountLedger accounts;
 
-    public AuthService(ExchangeUserRepository users, PasswordEncoder passwordEncoder, JwtTokenService tokens) {
+    public AuthService(ExchangeUserRepository users, PasswordEncoder passwordEncoder, JwtTokenService tokens,
+            AccountLedger accounts) {
         this.users = users;
         this.passwordEncoder = passwordEncoder;
         this.tokens = tokens;
+        this.accounts = accounts;
     }
 
+    @Transactional
     public long register(String email, String password) {
         String normalized = email.trim().toLowerCase(Locale.ROOT);
         if (password.getBytes(StandardCharsets.UTF_8).length > 72) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Password exceeds 72 UTF-8 bytes");
         }
         try {
-            return users.create(normalized, passwordEncoder.encode(password));
+            long id = users.create(normalized, passwordEncoder.encode(password));
+            accounts.openAccount(id);
+            return id;
         } catch (DuplicateKeyException e) {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "Email is already registered");
         }
