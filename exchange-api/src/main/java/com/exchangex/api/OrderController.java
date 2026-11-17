@@ -26,6 +26,20 @@ import java.util.concurrent.RejectedExecutionException;
 public class OrderController {
 
     private final DurableCommandCoordinator coordinator;
+    private SymbolCoordinatorRegistry coordinatorRegistry;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setCoordinatorRegistry(SymbolCoordinatorRegistry registry) {
+        this.coordinatorRegistry = registry;
+    }
+
+    private DurableCommandCoordinator forSymbol(String symbol) {
+        if (coordinatorRegistry != null) return coordinatorRegistry.coordinator(symbol);
+        if (!"AAPL".equals(symbol)) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Unknown instrument");
+        }
+        return coordinator;
+    }
     private final OrderRepository orderRepository;
     private final JdbcTemplate jdbcTemplate;
     @Value("${exchangex.security.enabled:true}")
@@ -61,9 +75,22 @@ public class OrderController {
             @Valid @RequestBody OrderRequest request,
             @AuthenticationPrincipal Jwt principal) {
 
+        return submitForSymbol("AAPL", request, principal);
+    }
+
+    @PostMapping("/instruments/{symbol}/orders")
+    public CompletableFuture<ResponseEntity<OrderSubmissionResponse>> submitBySymbol(
+            @PathVariable String symbol, @Valid @RequestBody OrderRequest request,
+            @AuthenticationPrincipal Jwt principal) {
+        return submitForSymbol(symbol, request, principal);
+    }
+
+    private CompletableFuture<ResponseEntity<OrderSubmissionResponse>> submitForSymbol(
+            String symbol, OrderRequest request, Jwt principal) {
+        DurableCommandCoordinator target = forSymbol(symbol);
         CompletableFuture<DurableCommandCoordinator.AdmissionResult> admission = securityEnabled
-                ? coordinator.submitOrderForUser(authenticatedUserId(principal), request.id(), request.side(), request.price(), request.quantity())
-                : coordinator.submitOrder(request.id(), request.side(), request.price(), request.quantity());
+                ? target.submitOrderForUser(authenticatedUserId(principal), request.id(), request.side(), request.price(), request.quantity())
+                : target.submitOrder(request.id(), request.side(), request.price(), request.quantity());
         return admission
                 .thenApply(ack -> ResponseEntity.status(HttpStatus.ACCEPTED)
                         .body(new OrderSubmissionResponse("PENDING", ack.sequenceId())))
@@ -74,12 +101,20 @@ public class OrderController {
                                 .body(new OrderSubmissionResponse("CONFLICT", 0));
                     }
                     if (cause instanceof IllegalArgumentException iae) {
-                        if (iae.getMessage().contains("different payload")) {
+                        if (iae.getMessage().contains("different payload") || iae.getMessage().contains("different instrument")) {
                             return ResponseEntity.status(HttpStatus.CONFLICT)
                                     .body(new OrderSubmissionResponse("CONFLICT", 0));
                         }
                         return ResponseEntity.badRequest()
                                 .body(new OrderSubmissionResponse("INVALID: " + iae.getMessage(), 0));
+                    }
+                    if (cause instanceof com.exchangex.api.accounts.AccountLedger.InsufficientBalanceException) {
+                        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                                .body(new OrderSubmissionResponse("INSUFFICIENT_BALANCE", 0));
+                    }
+                    if (cause instanceof ArithmeticException) {
+                        return ResponseEntity.badRequest()
+                                .body(new OrderSubmissionResponse("AMOUNT_OVERFLOW", 0));
                     }
                     if (cause instanceof RejectedExecutionException) {
                         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
@@ -104,9 +139,26 @@ public class OrderController {
             @PathVariable("id") long id,
             @AuthenticationPrincipal Jwt principal) {
 
+        return cancelForSymbol("AAPL", id, principal);
+    }
+
+    @DeleteMapping("/instruments/{symbol}/orders/{id}")
+    public CompletableFuture<ResponseEntity<CancelResponse>> cancelBySymbol(
+            @PathVariable String symbol, @PathVariable long id,
+            @AuthenticationPrincipal Jwt principal) {
+        return cancelForSymbol(symbol, id, principal);
+    }
+
+    private CompletableFuture<ResponseEntity<CancelResponse>> cancelForSymbol(
+            String symbol, long id, Jwt principal) {
+        DurableCommandCoordinator target = forSymbol(symbol);
+        if (orderRepository != null && !orderHasSymbol(id, symbol)) {
+            return CompletableFuture.completedFuture(ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(new CancelResponse("NOT_FOUND")));
+        }
         CompletableFuture<DurableCommandCoordinator.AdmissionResult> admission = securityEnabled
-                ? coordinator.cancelOrderForUser(authenticatedUserId(principal), id)
-                : coordinator.cancelOrder(id);
+                ? target.cancelOrderForUser(authenticatedUserId(principal), id)
+                : target.cancelOrder(id);
         return admission
                 .thenApply(ack -> ResponseEntity.status(HttpStatus.ACCEPTED)
                         .body(new CancelResponse("PENDING")))
@@ -142,20 +194,40 @@ public class OrderController {
     public CompletableFuture<ResponseEntity<OrderStateResponse>> getOrder(
             @PathVariable("id") long id,
             @AuthenticationPrincipal Jwt principal) {
+        return getForSymbol("AAPL", id, principal);
+    }
 
+    @GetMapping("/instruments/{symbol}/orders/{id}")
+    public CompletableFuture<ResponseEntity<OrderStateResponse>> getOrderBySymbol(
+            @PathVariable String symbol, @PathVariable long id,
+            @AuthenticationPrincipal Jwt principal) {
+        return getForSymbol(symbol, id, principal);
+    }
+
+    private boolean orderHasSymbol(long id, String symbol) {
+        if (jdbcTemplate == null) return "AAPL".equals(symbol);
+        return Boolean.TRUE.equals(jdbcTemplate.queryForObject(
+                "SELECT EXISTS(SELECT 1 FROM exchange_commands WHERE order_id=? AND command_type='SUBMIT' AND symbol=?)",
+                Boolean.class, id, symbol));
+    }
+
+    private CompletableFuture<ResponseEntity<OrderStateResponse>> getForSymbol(
+            String symbol, long id, Jwt principal) {
+        DurableCommandCoordinator target = forSymbol(symbol);
         if (securityEnabled && !ownedBy(id, authenticatedUserId(principal))) {
             return CompletableFuture.completedFuture(ResponseEntity.status(HttpStatus.NOT_FOUND)
                     .body(new OrderStateResponse(id, null, 0, 0, "NOT_FOUND", 0)));
         }
         if (orderRepository == null) {
             // Lightweight controller tests inject a mocked coordinator without a database.
-            return coordinator.findOrder(id).thenApply(found -> found
+            return target.findOrder(id).thenApply(found -> found
                     .map(r -> ResponseEntity.ok(new OrderStateResponse(
                             r.id(), r.side().name(), r.price(), r.remainingQuantity(), "PENDING", 0)))
                     .orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND)
                             .body(new OrderStateResponse(id, null, 0, 0, "NOT_FOUND", 0))));
         }
         return CompletableFuture.completedFuture(orderRepository.findByClientOrderId(id)
+                .filter(r -> r.symbol().equals(symbol))
                 .map(r -> ResponseEntity.ok(new OrderStateResponse(
                         r.clientOrderId(), r.side().name(), r.limitPrice(),
                         r.remainingQuantity(), r.executionStatus(), r.exchangeSequenceId())))
@@ -167,11 +239,7 @@ public class OrderController {
     public CompletableFuture<OrderBookResponse> book(
             @PathVariable("symbol") String symbol) {
 
-        if (!"AAPL".equals(symbol)) {
-            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Unknown instrument");
-        }
-
-        return coordinator.snapshot()
+        return forSymbol(symbol).snapshot()
                 .thenApply(snapshot -> new OrderBookResponse(
                         symbol,
                         snapshot.bestBid().map(v -> new MarketLevel(v.price(), v.remainingQuantity())),
@@ -181,9 +249,24 @@ public class OrderController {
 
     @GetMapping("/trades")
     public CompletableFuture<ResponseEntity<List<MarketTrade>>> trades() {
-        return coordinator.trades()
+        return tradesForSymbol("AAPL");
+    }
+
+    @GetMapping("/instruments/{symbol}/trades")
+    public CompletableFuture<ResponseEntity<List<MarketTrade>>> tradesBySymbol(@PathVariable String symbol) {
+        return tradesForSymbol(symbol);
+    }
+
+    private CompletableFuture<ResponseEntity<List<MarketTrade>>> tradesForSymbol(String symbol) {
+        return forSymbol(symbol).trades()
                 .thenApply(items -> ResponseEntity.ok(items.stream()
                         .map(t -> new MarketTrade(t.price(), t.quantity())).toList()));
+    }
+
+    @GetMapping("/instruments")
+    public List<String> instruments() {
+        if (coordinatorRegistry != null) return coordinatorRegistry.activeSymbols();
+        return List.of("AAPL");
     }
 
     // Response DTOs

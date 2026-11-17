@@ -92,6 +92,18 @@ public class AccountLedger {
         changeHolding(userId, symbol, eventKey, "RELEASE", quantity, Math.negateExact(quantity));
     }
 
+    // Package-scoped primitives used by the clearing service inside its surrounding
+    // admission/execution transaction; the ledger still enforces nonnegative totals
+    // and globally unique idempotency keys per account.
+    void applyCash(long userId, String key, String type, long availableDelta, long reservedDelta) {
+        changeCash(userId, key, type, availableDelta, reservedDelta);
+    }
+
+    void applyHolding(long userId, String symbol, String key, String type,
+                      long availableDelta, long reservedDelta) {
+        changeHolding(userId, symbol, key, type, availableDelta, reservedDelta);
+    }
+
     private void changeCash(long userId, String key, String type, long availableDelta, long reservedDelta) {
         positive(userId, "userId");
         validKey(key);

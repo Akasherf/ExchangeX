@@ -1,5 +1,6 @@
 package com.exchangex.api;
 
+import com.exchangex.api.accounts.TradingClearingService;
 import com.exchangex.api.repository.CheckpointRepository;
 import com.exchangex.api.repository.CommandRepository;
 import com.exchangex.api.repository.OrderRepository;
@@ -57,7 +58,10 @@ public class DurableCommandCoordinator implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(DurableCommandCoordinator.class);
 
-    private final String symbol = "AAPL";
+    private final String symbol;
+    @Nullable private TradingClearingService clearingService;
+    @Value("${exchangex.trading.enforced:true}")
+    private boolean tradingEnforced;
     private MatchingEngine matchingEngine;
     private final CommandRepository commandRepository;
     private final OrderRepository orderRepository;
@@ -86,6 +90,17 @@ public class DurableCommandCoordinator implements AutoCloseable {
     private final AtomicLong lastCommittedSequenceId = new AtomicLong(0);
     private CommandLifecycleObserver lifecycleObserver = CommandLifecycleObserver.NOOP;
 
+    /** For coordinators constructed by the registry instead of Spring. */
+    public void configureTrading(@Nullable TradingClearingService clearing, boolean enforce) {
+        this.clearingService = clearing;
+        this.tradingEnforced = enforce;
+    }
+
+    @Autowired(required = false)
+    public void setClearingService(TradingClearingService clearing) {
+        this.clearingService = clearing;
+    }
+
     /** Optional, best-effort telemetry. Never participates in transaction decisions. */
     @Autowired(required = false)
     public void setLifecycleObserver(CommandLifecycleObserver listener) {
@@ -113,7 +128,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
             JdbcTemplate jdbcTemplate,
             TransactionTemplate transactionTemplate
     ) {
-        this(matchingEngine, commandRepository, orderRepository, tradeRepository, checkpointRepository,
+        this("AAPL", matchingEngine, commandRepository, orderRepository, tradeRepository, checkpointRepository,
              jdbcTemplate, transactionTemplate, null);
     }
 
@@ -131,6 +146,26 @@ public class DurableCommandCoordinator implements AutoCloseable {
             TransactionTemplate transactionTemplate,
             @Nullable FailureInjection failureInjection
     ) {
+        this("AAPL", matchingEngine, commandRepository, orderRepository, tradeRepository,
+             checkpointRepository, jdbcTemplate, transactionTemplate, failureInjection);
+    }
+
+    /** Separate deterministic coordinator and checkpoint for each active instrument. */
+    DurableCommandCoordinator(
+            String symbol,
+            MatchingEngine matchingEngine,
+            CommandRepository commandRepository,
+            OrderRepository orderRepository,
+            TradeRepository tradeRepository,
+            CheckpointRepository checkpointRepository,
+            JdbcTemplate jdbcTemplate,
+            TransactionTemplate transactionTemplate,
+            @Nullable FailureInjection failureInjection
+    ) {
+        if (symbol == null || !symbol.matches("[A-Z][A-Z0-9]{0,9}")) {
+            throw new IllegalArgumentException("Invalid instrument symbol");
+        }
+        this.symbol = symbol;
         this.matchingEngine = matchingEngine;
         this.commandRepository = commandRepository;
         this.orderRepository = orderRepository;
@@ -204,6 +239,10 @@ public class DurableCommandCoordinator implements AutoCloseable {
     }
 
     private void initializeInternal() {
+        if (tradingEnforced) {
+            if (clearingService == null) throw new IllegalStateException("Funded trading enabled without clearing service");
+            clearingService.verifyActivation(symbol);
+        }
         // 1. Read checkpoint
         long checkpoint = checkpointRepository.getLastCompletedSequenceId(symbol);
         lastCommittedSequenceId.set(checkpoint);
@@ -499,6 +538,22 @@ public class DurableCommandCoordinator implements AutoCloseable {
                 tradeRepository.insertTrades(tradeRecords);
             }
 
+            // 2b. Financial settlement is part of the SAME transaction as trades,
+            // order projections, command completion and checkpoint advancement.
+            // Failed settlement rolls everything back; the worker halts and recovers.
+            if (tradingEnforced) {
+                for (int i = 0; i < trades.size(); i++) {
+                    clearingService.settleTrade(sequenceId, i, symbol, trades.get(i));
+                }
+                if (isCancel) {
+                    for (OrderUpdate update : orderUpdates) {
+                        if ("CANCELLED".equals(update.executionStatus())) {
+                            clearingService.releaseCancellation(update.clientOrderId());
+                        }
+                    }
+                }
+            }
+
             // Failure injection point 2: After trades, before command status
             if (failureInjection != null) {
                 failureInjection.afterTradesBeforeCommandStatus(sequenceId);
@@ -642,11 +697,25 @@ public class DurableCommandCoordinator implements AutoCloseable {
             }
             AdmissionResult prior = existingSubmitOrNull(clientOrderId, side, price, quantity);
             if (prior != null) return prior;
+            // Client order IDs remain globally unique across instruments.
+            // Explicitly reject a cross-symbol replay rather than exposing a DB exception.
+            Boolean globalCollision = jdbcTemplate.queryForObject(
+                    "SELECT EXISTS (SELECT 1 FROM exchange_commands WHERE order_id = ? AND command_type='SUBMIT')",
+                    Boolean.class, clientOrderId);
+            if (Boolean.TRUE.equals(globalCollision)) {
+                throw new IllegalArgumentException("Duplicate order ID with different instrument");
+            }
             enforceBackpressure();
             long sequenceId = commandRepository.insertSubmitCommand(clientOrderId, symbol, side, price, quantity);
+            if (tradingEnforced && userId == null) {
+                throw new SecurityException("Authenticated account required for funded trading");
+            }
             if (userId != null) {
                 jdbcTemplate.update("INSERT INTO order_ownership (order_id, submit_sequence_id, user_id) VALUES (?, ?, ?)",
                         clientOrderId, sequenceId, userId);
+                if (tradingEnforced) {
+                    clearingService.reserveForSubmission(clientOrderId, userId, symbol, side, price, quantity);
+                }
             }
             return new AdmissionResult(sequenceId, false);
         });
@@ -677,6 +746,9 @@ public class DurableCommandCoordinator implements AutoCloseable {
         ensureAcceptingCommands();
         AdmissionResult admitted = transactionTemplate.execute(tx -> {
             lockAdmissionTransaction();
+            if (tradingEnforced && userId == null) {
+                throw new SecurityException("Authenticated account required for funded trading");
+            }
             if (userId != null) requireOrderOwner(clientOrderId, userId);
             var existing = commandRepository.findPendingCancelByClientOrderId(clientOrderId, symbol);
             if (existing.isPresent()) return new AdmissionResult(existing.get().sequenceId(), true);
@@ -824,6 +896,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
         running.set(false);
         observe(o -> o.coordinatorRunning(false));
         admissionSignal.release();
+        if (executor == null || pollingScheduler == null) return;
         executor.shutdown();
         pollingScheduler.shutdown();
         try {
@@ -851,7 +924,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
         }
     }
 
-    record AdmissionResult(long sequenceId, boolean isDuplicate) {}
+    public record AdmissionResult(long sequenceId, boolean isDuplicate) {}
 
     public record BookSnapshot(
             Optional<OrderView> bestBid,

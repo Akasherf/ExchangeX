@@ -49,6 +49,7 @@ public class SecurityConfig {
             http.authorizeHttpRequests(a -> a
                     .requestMatchers(HttpMethod.POST, "/api/v1/auth/register", "/api/v1/auth/login").permitAll()
                     .requestMatchers(HttpMethod.GET, "/api/v1/orderbook/**", "/api/v1/trades",
+                            "/api/v1/instruments", "/api/v1/instruments/*/trades",
                             "/actuator/health", "/actuator/info").permitAll()
                     .anyRequest().authenticated())
                 .oauth2ResourceServer(o -> o.jwt(Customizer.withDefaults()));
