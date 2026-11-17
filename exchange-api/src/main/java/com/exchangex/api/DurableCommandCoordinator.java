@@ -12,6 +12,7 @@ import com.exchangex.engine.Trade;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.lang.Nullable;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -83,6 +84,22 @@ public class DurableCommandCoordinator implements AutoCloseable {
     private final AtomicReference<List<Trade>> publishedTrades = new AtomicReference<>(List.of());
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong lastCommittedSequenceId = new AtomicLong(0);
+    private CommandLifecycleObserver lifecycleObserver = CommandLifecycleObserver.NOOP;
+
+    /** Optional, best-effort telemetry. Never participates in transaction decisions. */
+    @Autowired(required = false)
+    public void setLifecycleObserver(CommandLifecycleObserver listener) {
+        this.lifecycleObserver = listener == null ? CommandLifecycleObserver.NOOP : listener;
+    }
+
+    private void observe(java.util.function.Consumer<CommandLifecycleObserver> event) {
+        try {
+            event.accept(lifecycleObserver);
+        } catch (RuntimeException observerFailure) {
+            // Telemetry must never modify execution, recovery, or admission semantics.
+            log.warn("Command telemetry callback failed", observerFailure);
+        }
+    }
 
     // Dedicated scheduler for execution future polling
     private ScheduledExecutorService pollingScheduler;
@@ -167,6 +184,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
     public synchronized void reinitialize() {
         log.info("Reinitializing coordinator for {}", symbol);
         running.set(false);
+        observe(o -> o.coordinatorRunning(false));
         admissionSignal.release();
         executor.shutdownNow();
         pollingScheduler.shutdownNow();
@@ -200,6 +218,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
 
         // 4. Start background worker
         running.set(true);
+        observe(o -> o.coordinatorRunning(true));
         executor.execute(this::processLoop);
         log.info("Durable coordinator started for {}", symbol);
     }
@@ -261,10 +280,16 @@ public class DurableCommandCoordinator implements AutoCloseable {
         log.info("Replaying {} pending commands for {}", pendingCommands.size(), symbol);
 
         for (CommandRepository.CommandRecord cmd : pendingCommands) {
+            long executionStart = System.nanoTime();
             try {
                 ExecutionResult result = executeCommand(cmd);
+                long commitStart = System.nanoTime();
                 commitResults(cmd.sequenceId(), result.trades(), result.orderUpdates(), result.isCancel());
+                long committed = System.nanoTime();
+                observe(o -> o.commandCommitted(cmd.commandType(), true,
+                        commitStart - executionStart, committed - commitStart, result.trades().size()));
             } catch (Exception e) {
+                observe(o -> o.commandFailed(true));
                 log.error("Failed to replay command {}: {}", cmd.sequenceId(), e.getMessage(), e);
                 // Leave journal entry PENDING for the next recovery attempt.
                 // Stop replay on first failure - intervention may be needed
@@ -301,18 +326,25 @@ public class DurableCommandCoordinator implements AutoCloseable {
                 break;
             } catch (Exception e) {
                 running.set(false);
+                observe(o -> o.coordinatorRunning(false));
                 log.error("Durable journal polling halted for {}", symbol, e);
             }
         }
     }
 
     private void processCommand(CommandRepository.CommandRecord cmd) {
+        long executionStart = System.nanoTime();
         try {
             ExecutionResult result = executeCommand(cmd);
+            long commitStart = System.nanoTime();
             commitResults(cmd.sequenceId(), result.trades(), result.orderUpdates(), result.isCancel());
+            long committed = System.nanoTime();
             lastCommittedSequenceId.set(cmd.sequenceId());
             publishCommittedState();
+            observe(o -> o.commandCommitted(cmd.commandType(), false,
+                    commitStart - executionStart, committed - commitStart, result.trades().size()));
         } catch (Exception e) {
+            observe(o -> o.commandFailed(false));
             log.error("Execution/commit failed for sequence {}. Halting coordinator; marking command FAILED for restart replay.", cmd.sequenceId(), e);
             try {
                 commandRepository.markFailed(cmd.sequenceId());
@@ -320,6 +352,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
                 log.error("Failed to mark command {} as FAILED", cmd.sequenceId(), markFailedEx);
             }
             running.set(false);
+            observe(o -> o.coordinatorRunning(false));
         }
     }
 
@@ -589,6 +622,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
     }
 
     public AdmissionResult admitSubmit(long clientOrderId, Side side, long price, long quantity) {
+        long admissionStart = System.nanoTime();
         ensureAcceptingCommands();
         AdmissionResult admitted = transactionTemplate.execute(tx -> {
             lockAdmissionTransaction();
@@ -600,6 +634,8 @@ public class DurableCommandCoordinator implements AutoCloseable {
         });
         if (admitted == null) throw new IllegalStateException("Admission transaction returned no result");
         if (!admitted.isDuplicate()) admissionSignal.release();
+        long admissionNanos = System.nanoTime() - admissionStart;
+        observe(o -> o.commandAdmitted("SUBMIT", admitted.isDuplicate(), admissionNanos));
         return admitted;
     }
 
@@ -609,6 +645,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
      * SUBMIT first and then cancel any remaining resting quantity.
      */
     public AdmissionResult admitCancel(long clientOrderId) {
+        long admissionStart = System.nanoTime();
         ensureAcceptingCommands();
         AdmissionResult admitted = transactionTemplate.execute(tx -> {
             lockAdmissionTransaction();
@@ -631,6 +668,8 @@ public class DurableCommandCoordinator implements AutoCloseable {
         });
         if (admitted == null) throw new IllegalStateException("Admission transaction returned no result");
         if (!admitted.isDuplicate()) admissionSignal.release();
+        long admissionNanos = System.nanoTime() - admissionStart;
+        observe(o -> o.commandAdmitted("CANCEL", admitted.isDuplicate(), admissionNanos));
         return admitted;
     }
 
@@ -727,6 +766,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
     @Override
     public void close() {
         running.set(false);
+        observe(o -> o.coordinatorRunning(false));
         admissionSignal.release();
         executor.shutdown();
         pollingScheduler.shutdown();
