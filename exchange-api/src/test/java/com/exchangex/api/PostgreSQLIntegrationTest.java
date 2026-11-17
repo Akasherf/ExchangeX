@@ -8,6 +8,7 @@ import com.exchangex.engine.Side;
 import com.exchangex.engine.Trade;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -18,7 +19,6 @@ import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
-import org.springframework.test.context.jdbc.Sql;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
@@ -38,11 +38,19 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * Uses the database specified by EXCHANGEX_TEST_DB_URL (a dedicated test database).
  * Run with: mvn -pl exchange-api -am -Dtest=PostgreSQLIntegrationTest -Dsurefire.failIfNoSpecifiedTests=false test
  */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, classes = ExchangeApiApplication.class)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, classes = ExchangeApiApplication.class,
+        properties = {
+                "spring.autoconfigure.exclude=org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration,org.springframework.boot.autoconfigure.data.jpa.JpaRepositoriesAutoConfiguration",
+                "spring.datasource.url=${EXCHANGEX_TEST_DB_URL}",
+                "spring.datasource.username=${EXCHANGEX_TEST_DB_USERNAME}",
+                "spring.datasource.password=${EXCHANGEX_TEST_DB_PASSWORD}",
+                "spring.datasource.driver-class-name=org.postgresql.Driver",
+                "spring.flyway.enabled=false",
+                "coordinator.auto-initialize=false"
+        })
 @AutoConfigureMockMvc
-@ActiveProfiles("postgres-integration")
+@ActiveProfiles(profiles = "postgres-integration", inheritProfiles = false)
 @EnabledIfEnvironmentVariable(named = "EXCHANGEX_TEST_DB_URL", matches = ".+")
-@Sql(scripts = "/test-cleanup.sql", executionPhase = Sql.ExecutionPhase.BEFORE_TEST_METHOD)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_EACH_TEST_METHOD)
 class PostgreSQLIntegrationTest {
 
@@ -64,6 +72,9 @@ class PostgreSQLIntegrationTest {
     @Autowired
     private DataSource dataSource;
 
+    @Autowired
+    private DurableCommandCoordinator coordinator;
+
     private static final AtomicLong idGenerator = new AtomicLong(1000000 + System.currentTimeMillis());
 
     private long nextId() {
@@ -80,6 +91,30 @@ class PostgreSQLIntegrationTest {
     static void runFlywayMigrations(@Autowired DataSource dataSource) {
         Flyway flyway = Flyway.configure().dataSource(dataSource).locations("classpath:db/migration").load();
         flyway.migrate();
+    }
+
+    @BeforeEach
+    void setUp() {
+        // Clean database before each test (replaces @Sql which ran before test method)
+        cleanDatabase();
+        // Initialize coordinator after cleanup (auto-initialize is disabled in test config)
+        coordinator.initialize();
+        waitForBackgroundProcessing(1000);
+    }
+
+    private void cleanDatabase() {
+        tradeRepository.deleteAll();
+        orderRepository.deleteAll();
+        commandRepository.deleteAll();
+        checkpointRepository.reset();
+    }
+
+    private void waitForBackgroundProcessing(long maxWaitMs) {
+        try {
+            Thread.sleep(maxWaitMs);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
 @Test

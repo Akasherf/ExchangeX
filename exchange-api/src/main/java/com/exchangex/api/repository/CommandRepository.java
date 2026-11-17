@@ -35,10 +35,14 @@ public interface CommandRepository {
     Optional<CommandRecord> findPendingCancelByClientOrderId(long clientOrderId, String symbol);
 
     /**
-     * Get all pending commands for a symbol since a given sequence_id (exclusive), ordered by sequence_id.
+     * Get all commands eligible for replay for a symbol since a given sequence_id (exclusive), ordered by sequence_id.
+     * Includes both PENDING and FAILED commands, as both need to be replayed on recovery.
      * Used for replay and catch-up processing.
      */
     List<CommandRecord> findPendingCommandsSince(String symbol, long lastCompletedSequenceId);
+
+    /** Number of commands not yet completed for this instrument (for admission backpressure). */
+    long countOutstanding(String symbol);
 
     /**
      * Mark a command as COMPLETED with timestamp.

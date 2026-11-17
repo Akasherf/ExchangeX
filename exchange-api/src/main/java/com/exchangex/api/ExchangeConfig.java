@@ -5,6 +5,7 @@ import com.exchangex.api.repository.CommandRepository;
 import com.exchangex.api.repository.OrderRepository;
 import com.exchangex.api.repository.TradeRepository;
 import com.exchangex.engine.MatchingEngine;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
@@ -27,7 +28,7 @@ public class ExchangeConfig {
     }
 
     @Bean(destroyMethod = "close")
-    @Profile("!test")
+    @ConditionalOnMissingBean
     DurableCommandCoordinator durableCommandCoordinator(
             MatchingEngine matchingEngine,
             CommandRepository commandRepository,

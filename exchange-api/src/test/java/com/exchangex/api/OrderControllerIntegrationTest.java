@@ -219,9 +219,9 @@ class OrderControllerIntegrationTest {
                 .andExpect(status().isOk())
                 .andExpect(content().contentType(MediaType.APPLICATION_JSON))
                 .andExpect(jsonPath("$.symbol", is("AAPL")))
-                .andExpect(jsonPath("$.bestBid.id", is(1)))
+                .andExpect(jsonPath("$.bestBid.id").doesNotExist())
                 .andExpect(jsonPath("$.bestBid.price", is(10000)))
-                .andExpect(jsonPath("$.bestAsk.id", is(2)))
+                .andExpect(jsonPath("$.bestAsk.id").doesNotExist())
                 .andExpect(jsonPath("$.bestAsk.price", is(10100)));
     }
 
@@ -247,10 +247,11 @@ class OrderControllerIntegrationTest {
                 .andExpect(status().isOk())
                 .andExpect(content().contentType(MediaType.APPLICATION_JSON))
                 .andExpect(jsonPath("$", hasSize(2)))
-                .andExpect(jsonPath("$[0].buyOrderId", is(1)))
-                .andExpect(jsonPath("$[0].sellOrderId", is(2)))
-                .andExpect(jsonPath("$[1].buyOrderId", is(3)))
-                .andExpect(jsonPath("$[1].sellOrderId", is(4)));
+                .andExpect(jsonPath("$[0].price", is(10000)))
+                .andExpect(jsonPath("$[0].buyOrderId").doesNotExist())
+                .andExpect(jsonPath("$[0].sellOrderId").doesNotExist())
+                .andExpect(jsonPath("$[1].price", is(9900)))
+                .andExpect(jsonPath("$[1].buyOrderId").doesNotExist());
     }
 
     @Test

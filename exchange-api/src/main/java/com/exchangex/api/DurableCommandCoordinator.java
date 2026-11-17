@@ -1,5 +1,6 @@
 package com.exchangex.api;
 
+import com.exchangex.api.accounts.TradingClearingService;
 import com.exchangex.api.repository.CheckpointRepository;
 import com.exchangex.api.repository.CommandRepository;
 import com.exchangex.api.repository.OrderRepository;
@@ -11,8 +12,10 @@ import com.exchangex.engine.Side;
 import com.exchangex.engine.Trade;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.dao.DuplicateKeyException;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.lang.Nullable;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import jakarta.annotation.PostConstruct;
@@ -20,6 +23,7 @@ import jakarta.annotation.PreDestroy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -32,7 +36,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *    - Returns 202 ACCEPTED with sequence_id immediately after commit
  *    - Idempotency: duplicate client order_id returns existing sequence_id
  *
- * 2. EXECUTE: Background worker processes pending commands in strict sequence_id order
+ * 2. EXECUTE: Background worker reads committed commands in strict sequence_id order
  *    - Mutates MatchingEngine (in-memory)
  *    - Builds result projection (trades, order state changes)
  *
@@ -46,14 +50,18 @@ import java.util.concurrent.atomic.AtomicLong;
  * 4. RECOVERY: On startup, rebuild MatchingEngine from committed orders/trades,
  *    then replay commands with sequence_id > checkpoint.
  *
- * Thread model: Single background thread per symbol (currently only AAPL).
- * All MatchingEngine mutations happen on this thread only.
+ * Thread model: One active coordinator/background worker per symbol (currently AAPL).
+ * All MatchingEngine mutations happen on this thread only. Multiple application
+ * instances processing the same symbol are NOT supported without leader fencing.
  */
 public class DurableCommandCoordinator implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(DurableCommandCoordinator.class);
 
-    private final String symbol = "AAPL";
+    private final String symbol;
+    @Nullable private TradingClearingService clearingService;
+    @Value("${exchangex.trading.enforced:true}")
+    private boolean tradingEnforced;
     private MatchingEngine matchingEngine;
     private final CommandRepository commandRepository;
     private final OrderRepository orderRepository;
@@ -62,17 +70,54 @@ public class DurableCommandCoordinator implements AutoCloseable {
     private final JdbcTemplate jdbcTemplate;
     private final TransactionTemplate transactionTemplate;
 
-    private final ExecutorService executor;
-    private final BlockingQueue<CommandTask> commandQueue;
+    // Test-only failure injection seam (package-private, null in production)
+    @Nullable
+    private final FailureInjection failureInjection;
+
+    // Allow disabling auto-initialization for tests (default true for production)
+    @Value("${coordinator.auto-initialize:true}")
+    private boolean autoInitialize;
+
+    private ExecutorService executor;
+    // PostgreSQL is authoritative. Signals only reduce polling latency; they carry no commands.
+    private final Semaphore admissionSignal = new Semaphore(0);
+    private static final int MAX_OUTSTANDING = 1024;
+    private static final int ADMISSION_LOCK_NAMESPACE = 27182;
+    private final AtomicReference<BookSnapshot> publishedBook = new AtomicReference<>(
+            new BookSnapshot(Optional.empty(), Optional.empty()));
+    private final AtomicReference<List<Trade>> publishedTrades = new AtomicReference<>(List.of());
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong lastCommittedSequenceId = new AtomicLong(0);
+    private CommandLifecycleObserver lifecycleObserver = CommandLifecycleObserver.NOOP;
 
-    // For coordinating shutdown
-    private final CountDownLatch shutdownLatch = new CountDownLatch(1);
+    /** For coordinators constructed by the registry instead of Spring. */
+    public void configureTrading(@Nullable TradingClearingService clearing, boolean enforce) {
+        this.clearingService = clearing;
+        this.tradingEnforced = enforce;
+    }
+
+    @Autowired(required = false)
+    public void setClearingService(TradingClearingService clearing) {
+        this.clearingService = clearing;
+    }
+
+    /** Optional, best-effort telemetry. Never participates in transaction decisions. */
+    @Autowired(required = false)
+    public void setLifecycleObserver(CommandLifecycleObserver listener) {
+        this.lifecycleObserver = listener == null ? CommandLifecycleObserver.NOOP : listener;
+    }
+
+    private void observe(java.util.function.Consumer<CommandLifecycleObserver> event) {
+        try {
+            event.accept(lifecycleObserver);
+        } catch (RuntimeException observerFailure) {
+            // Telemetry must never modify execution, recovery, or admission semantics.
+            log.warn("Command telemetry callback failed", observerFailure);
+        }
+    }
 
     // Dedicated scheduler for execution future polling
-    private final ScheduledExecutorService pollingScheduler =
-        Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "execution-future-poller-" + symbol));
+    private ScheduledExecutorService pollingScheduler;
 
     public DurableCommandCoordinator(
             MatchingEngine matchingEngine,
@@ -83,6 +128,44 @@ public class DurableCommandCoordinator implements AutoCloseable {
             JdbcTemplate jdbcTemplate,
             TransactionTemplate transactionTemplate
     ) {
+        this("AAPL", matchingEngine, commandRepository, orderRepository, tradeRepository, checkpointRepository,
+             jdbcTemplate, transactionTemplate, null);
+    }
+
+    /**
+     * Package-private constructor for test configuration with failure injection.
+     * Only used by test configurations in postgres-integration profile.
+     */
+    DurableCommandCoordinator(
+            MatchingEngine matchingEngine,
+            CommandRepository commandRepository,
+            OrderRepository orderRepository,
+            TradeRepository tradeRepository,
+            CheckpointRepository checkpointRepository,
+            JdbcTemplate jdbcTemplate,
+            TransactionTemplate transactionTemplate,
+            @Nullable FailureInjection failureInjection
+    ) {
+        this("AAPL", matchingEngine, commandRepository, orderRepository, tradeRepository,
+             checkpointRepository, jdbcTemplate, transactionTemplate, failureInjection);
+    }
+
+    /** Separate deterministic coordinator and checkpoint for each active instrument. */
+    DurableCommandCoordinator(
+            String symbol,
+            MatchingEngine matchingEngine,
+            CommandRepository commandRepository,
+            OrderRepository orderRepository,
+            TradeRepository tradeRepository,
+            CheckpointRepository checkpointRepository,
+            JdbcTemplate jdbcTemplate,
+            TransactionTemplate transactionTemplate,
+            @Nullable FailureInjection failureInjection
+    ) {
+        if (symbol == null || !symbol.matches("[A-Z][A-Z0-9]{0,9}")) {
+            throw new IllegalArgumentException("Invalid instrument symbol");
+        }
+        this.symbol = symbol;
         this.matchingEngine = matchingEngine;
         this.commandRepository = commandRepository;
         this.orderRepository = orderRepository;
@@ -90,18 +173,76 @@ public class DurableCommandCoordinator implements AutoCloseable {
         this.checkpointRepository = checkpointRepository;
         this.jdbcTemplate = jdbcTemplate;
         this.transactionTemplate = transactionTemplate;
+        this.failureInjection = failureInjection;
 
-        this.commandQueue = new ArrayBlockingQueue<>(1024);
-        this.executor = new ThreadPoolExecutor(
-                1, 1, 0L, TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<>(1024), // executor's internal queue
-                r -> new Thread(r, "durable-coordinator-" + symbol),
-                new ThreadPoolExecutor.AbortPolicy()
-        );
+        // Only create executor/scheduler for production mode (when repositories are provided)
+        // TestDurableCommandCoordinator passes null repositories and overrides initialize/close
+        boolean isProductionMode = commandRepository != null;
+        if (isProductionMode) {
+            this.executor = Executors.newSingleThreadExecutor(
+                    r -> new Thread(r, "durable-coordinator-" + symbol));
+            this.pollingScheduler = Executors.newSingleThreadScheduledExecutor(
+                    r -> new Thread(r, "execution-future-poller-" + symbol)
+            );
+        } else {
+            this.executor = null;
+            this.pollingScheduler = null;
+        }
     }
 
+    /**
+     * Spring-managed startup hook. Integration tests can suppress automatic replay
+     * until the dedicated test database has been cleaned.
+     */
     @PostConstruct
+    void autoInitializeOnStartup() {
+        if (autoInitialize) {
+            initialize();
+        } else {
+            log.info("Auto-initialize disabled for {}", symbol);
+        }
+    }
+
+    /**
+     * Explicitly start or recover this coordinator. Unlike the Spring startup
+     * hook, this method must also work on manually constructed coordinators
+     * used to simulate a fresh process during recovery tests.
+     */
     public void initialize() {
+        initializeInternal();
+    }
+
+    /**
+     * Reinitialize the coordinator from the current database state.
+     * Used by tests to sync in-memory state after database cleanup.
+     */
+    public synchronized void reinitialize() {
+        log.info("Reinitializing coordinator for {}", symbol);
+        running.set(false);
+        observe(o -> o.coordinatorRunning(false));
+        admissionSignal.release();
+        executor.shutdownNow();
+        pollingScheduler.shutdownNow();
+        try {
+            if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("Previous coordinator worker is still running");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while stopping previous coordinator worker", e);
+        }
+        executor = Executors.newSingleThreadExecutor(
+                r -> new Thread(r, "durable-coordinator-" + symbol));
+        pollingScheduler = Executors.newSingleThreadScheduledExecutor(
+                r -> new Thread(r, "execution-future-poller-" + symbol));
+        initializeInternal();
+    }
+
+    private void initializeInternal() {
+        if (tradingEnforced) {
+            if (clearingService == null) throw new IllegalStateException("Funded trading enabled without clearing service");
+            clearingService.verifyActivation(symbol);
+        }
         // 1. Read checkpoint
         long checkpoint = checkpointRepository.getLastCompletedSequenceId(symbol);
         lastCommittedSequenceId.set(checkpoint);
@@ -112,9 +253,11 @@ public class DurableCommandCoordinator implements AutoCloseable {
 
         // 3. Replay any commands between checkpoint and current journal head
         replayPendingCommands(checkpoint);
+        publishCommittedState();
 
         // 4. Start background worker
         running.set(true);
+        observe(o -> o.coordinatorRunning(true));
         executor.execute(this::processLoop);
         log.info("Durable coordinator started for {}", symbol);
     }
@@ -162,7 +305,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
 
     /**
      * Replay commands that were committed to journal but not yet processed.
-     * These are commands with sequence_id > checkpoint and status = PENDING.
+     * These are commands with sequence_id > checkpoint and status PENDING or FAILED.
      */
     private void replayPendingCommands(long checkpoint) {
         List<CommandRepository.CommandRecord> pendingCommands =
@@ -176,10 +319,16 @@ public class DurableCommandCoordinator implements AutoCloseable {
         log.info("Replaying {} pending commands for {}", pendingCommands.size(), symbol);
 
         for (CommandRepository.CommandRecord cmd : pendingCommands) {
+            long executionStart = System.nanoTime();
             try {
                 ExecutionResult result = executeCommand(cmd);
+                long commitStart = System.nanoTime();
                 commitResults(cmd.sequenceId(), result.trades(), result.orderUpdates(), result.isCancel());
+                long committed = System.nanoTime();
+                observe(o -> o.commandCommitted(cmd.commandType(), true,
+                        commitStart - executionStart, committed - commitStart, result.trades().size()));
             } catch (Exception e) {
+                observe(o -> o.commandFailed(true));
                 log.error("Failed to replay command {}: {}", cmd.sequenceId(), e.getMessage(), e);
                 // Leave journal entry PENDING for the next recovery attempt.
                 // Stop replay on first failure - intervention may be needed
@@ -192,63 +341,64 @@ public class DurableCommandCoordinator implements AutoCloseable {
     }
 
     /**
-     * Main processing loop - runs on single background thread.
+     * Drain the authoritative, committed PostgreSQL journal in sequence order.
+     * Never execute an in-memory enqueue order: concurrent callers may commit and
+     * notify in a different order. The admission transaction's per-symbol
+     * advisory lock makes committed sequence ordering unambiguous.
      */
     private void processLoop() {
-        try {
-            while (running.get()) {
-                CommandTask task;
-                try {
-                    task = commandQueue.poll(100, TimeUnit.MILLISECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
+        while (running.get()) {
+            try {
+                List<CommandRepository.CommandRecord> pending =
+                        commandRepository.findPendingCommandsSince(symbol, lastCommittedSequenceId.get());
+                if (pending.isEmpty()) {
+                    // Coalesce notifications; the DB scan, not the permit count,
+                    // determines which commands are executable.
+                    admissionSignal.drainPermits();
+                    admissionSignal.tryAcquire(100, TimeUnit.MILLISECONDS);
+                    continue;
                 }
-
-                if (task == null) continue;
-
-                try {
-                    processCommand(task);
-                } catch (Exception e) {
-                    log.error("Error processing command {}: {}", task.command().sequenceId(), e.getMessage(), e);
-                    task.completeExceptionally(e);
-                }
+                // Read one at a time so each checkpoint is persisted before taking the next.
+                processCommand(pending.get(0));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                running.set(false);
+                observe(o -> o.coordinatorRunning(false));
+                log.error("Durable journal polling halted for {}", symbol, e);
             }
-        } finally {
-            shutdownLatch.countDown();
         }
     }
 
-    private void processCommand(CommandTask task) {
-        CommandRepository.CommandRecord cmd = task.command();
-
+    private void processCommand(CommandRepository.CommandRecord cmd) {
+        long executionStart = System.nanoTime();
         try {
-            // Execute against MatchingEngine
             ExecutionResult result = executeCommand(cmd);
-
-            // Commit results atomically
+            long commitStart = System.nanoTime();
             commitResults(cmd.sequenceId(), result.trades(), result.orderUpdates(), result.isCancel());
-
-            // Advance checkpoint
+            long committed = System.nanoTime();
             lastCommittedSequenceId.set(cmd.sequenceId());
-
-            // Complete the future successfully
-            task.complete(result);
-
+            publishCommittedState();
+            observe(o -> o.commandCommitted(cmd.commandType(), false,
+                    commitStart - executionStart, committed - commitStart, result.trades().size()));
         } catch (Exception e) {
-            // A committed admission must never be silently discarded after a transient failure.
-            // PostgreSQL rolled back the results; the in-memory engine did not.
-            // Stop processing and rely on restart recovery to replay the still-PENDING command.
-            log.error("Execution/commit failed for sequence {}. Halting coordinator; command remains PENDING for restart replay.", cmd.sequenceId(), e);
-            // Mark command as FAILED so restart can distinguish from never-processed
+            observe(o -> o.commandFailed(false));
+            log.error("Execution/commit failed for sequence {}. Halting coordinator; marking command FAILED for restart replay.", cmd.sequenceId(), e);
             try {
                 commandRepository.markFailed(cmd.sequenceId());
             } catch (Exception markFailedEx) {
                 log.error("Failed to mark command {} as FAILED", cmd.sequenceId(), markFailedEx);
             }
             running.set(false);
-            task.completeExceptionally(e);
+            observe(o -> o.coordinatorRunning(false));
         }
+    }
+
+    /** Immutable committed-state snapshots, never live reads of mutable TreeMaps. */
+    private void publishCommittedState() {
+        publishedBook.set(new BookSnapshot(matchingEngine.bestBid(), matchingEngine.bestAsk()));
+        publishedTrades.set(List.copyOf(matchingEngine.trades()));
     }
 
     /**
@@ -317,7 +467,8 @@ public class DurableCommandCoordinator implements AutoCloseable {
      * Atomically commit execution results to database.
      * Single transaction: orders + trades + command status + checkpoint.
      * Orders must be inserted first to satisfy FK constraints on trades.
-     * If this fails, the MatchingEngine heap is now divergent from DB.
+     * If this fails, the MatchingEngine heap is now divergent from DB; processing
+     * must halt and restart from committed state rather than continue.
      */
     protected void commitResults(long sequenceId, List<Trade> trades, List<OrderUpdate> orderUpdates, boolean isCancel) {
         transactionTemplate.executeWithoutResult(txStatus -> {
@@ -365,6 +516,11 @@ public class DurableCommandCoordinator implements AutoCloseable {
                 }
             }
 
+            // Failure injection point 1: After orders, before trades
+            if (failureInjection != null) {
+                failureInjection.afterOrdersBeforeTrades(sequenceId);
+            }
+
             // 2. Insert trades with sequence references (after orders exist)
             if (!trades.isEmpty()) {
                 List<TradeRepository.TradeRecord> tradeRecords = new ArrayList<>();
@@ -382,8 +538,34 @@ public class DurableCommandCoordinator implements AutoCloseable {
                 tradeRepository.insertTrades(tradeRecords);
             }
 
+            // 2b. Financial settlement is part of the SAME transaction as trades,
+            // order projections, command completion and checkpoint advancement.
+            // Failed settlement rolls everything back; the worker halts and recovers.
+            if (tradingEnforced) {
+                for (int i = 0; i < trades.size(); i++) {
+                    clearingService.settleTrade(sequenceId, i, symbol, trades.get(i));
+                }
+                if (isCancel) {
+                    for (OrderUpdate update : orderUpdates) {
+                        if ("CANCELLED".equals(update.executionStatus())) {
+                            clearingService.releaseCancellation(update.clientOrderId());
+                        }
+                    }
+                }
+            }
+
+            // Failure injection point 2: After trades, before command status
+            if (failureInjection != null) {
+                failureInjection.afterTradesBeforeCommandStatus(sequenceId);
+            }
+
             // 3. Mark command as completed
             commandRepository.markCompleted(sequenceId);
+
+            // Failure injection point 3: After command status, before checkpoint
+            if (failureInjection != null) {
+                failureInjection.afterCommandStatusBeforeCheckpoint(sequenceId);
+            }
 
             // 4. Advance checkpoint
             checkpointRepository.advanceIfGreater(symbol, sequenceId);
@@ -462,101 +644,164 @@ public class DurableCommandCoordinator implements AutoCloseable {
     }
 
     /**
-     * Admit a SUBMIT command to the durable journal.
-     * Returns the sequence_id if admitted, or existing sequence_id if idempotent retry.
-     * Throws if duplicate order_id with different payload.
-     * Throws RejectedExecutionException if command queue is full (backpressure).
+     * Serialize the journal INSERT and its commit in PostgreSQL (not just in Java).
+     * An identity/sequence number is assigned before commit; without serialization,
+     * sequence 101 could commit and execute before an uncommitted sequence 100.
      */
-    public AdmissionResult admitSubmit(long clientOrderId, Side side, long price, long quantity) {
-        // Check queue capacity BEFORE journal admission (backpressure)
-        if (commandQueue.remainingCapacity() == 0) {
-            throw new RejectedExecutionException("Command queue full");
-        }
+    private void lockAdmissionTransaction() {
+        jdbcTemplate.query("SELECT pg_advisory_xact_lock(?, hashtext(?))",
+                rs -> { /* wait for lock, no result to map */ }, ADMISSION_LOCK_NAMESPACE, symbol);
+    }
 
-        // Check for existing pending SUBMIT with same order_id
+    private void ensureAcceptingCommands() {
+        if (!running.get()) {
+            throw new RejectedExecutionException("Coordinator not accepting commands");
+        }
+    }
+
+    private void enforceBackpressure() {
+        if (commandRepository.countOutstanding(symbol) >= MAX_OUTSTANDING) {
+            throw new RejectedExecutionException("Outstanding command limit reached");
+        }
+    }
+
+    /** The payload of an idempotent retry must match, including after COMPLETED. */
+    private AdmissionResult existingSubmitOrNull(long clientOrderId, Side side, long price, long quantity) {
         var existing = commandRepository.findPendingSubmitByClientOrderId(clientOrderId, symbol);
-        if (existing.isPresent()) {
-            CommandRepository.CommandRecord cmd = existing.get();
-            // Verify payload matches (idempotency with payload check)
-            if (cmd.side() != side || cmd.price() != price || cmd.quantity() != quantity) {
-                throw new IllegalArgumentException("Duplicate order ID with different payload: " + clientOrderId);
-            }
-            return new AdmissionResult(cmd.sequenceId(), true); // duplicate, idempotent
+        if (existing.isEmpty()) return null;
+        var cmd = existing.get();
+        if (cmd.side() != side || cmd.price() != price || cmd.quantity() != quantity) {
+            throw new IllegalArgumentException("Duplicate order ID with different payload: " + clientOrderId);
         }
+        return new AdmissionResult(cmd.sequenceId(), true);
+    }
 
-        // Insert new command
-        long sequenceId;
-        try {
-            sequenceId = commandRepository.insertSubmitCommand(clientOrderId, symbol, side, price, quantity);
-        } catch (DuplicateKeyException e) {
-            // Race condition: another thread inserted same order_id
-            var retry = commandRepository.findPendingSubmitByClientOrderId(clientOrderId, symbol);
-            if (retry.isPresent()) {
-                CommandRepository.CommandRecord cmd = retry.get();
-                if (cmd.side() != side || cmd.price() != price || cmd.quantity() != quantity) {
-                    throw new IllegalArgumentException("Duplicate order ID with different payload: " + clientOrderId);
+    public AdmissionResult admitSubmit(long clientOrderId, Side side, long price, long quantity) {
+        return admitSubmitInternal(null, clientOrderId, side, price, quantity);
+    }
+
+    /** Authenticated admission: owner is recorded atomically with the SUBMIT journal row. */
+    public AdmissionResult admitSubmitForUser(long userId, long clientOrderId, Side side, long price, long quantity) {
+        if (userId <= 0) throw new SecurityException("Invalid account");
+        return admitSubmitInternal(userId, clientOrderId, side, price, quantity);
+    }
+
+    private AdmissionResult admitSubmitInternal(Long userId, long clientOrderId, Side side, long price, long quantity) {
+        long admissionStart = System.nanoTime();
+        ensureAcceptingCommands();
+        AdmissionResult admitted = transactionTemplate.execute(tx -> {
+            lockAdmissionTransaction();
+            // Protect ownership even on idempotent retries (global client IDs are unique).
+            if (userId != null && commandRepository.findPendingSubmitByClientOrderId(clientOrderId, symbol).isPresent()) {
+                requireOrderOwner(clientOrderId, userId);
+            }
+            AdmissionResult prior = existingSubmitOrNull(clientOrderId, side, price, quantity);
+            if (prior != null) return prior;
+            // Client order IDs remain globally unique across instruments.
+            // Explicitly reject a cross-symbol replay rather than exposing a DB exception.
+            Boolean globalCollision = jdbcTemplate.queryForObject(
+                    "SELECT EXISTS (SELECT 1 FROM exchange_commands WHERE order_id = ? AND command_type='SUBMIT')",
+                    Boolean.class, clientOrderId);
+            if (Boolean.TRUE.equals(globalCollision)) {
+                throw new IllegalArgumentException("Duplicate order ID with different instrument");
+            }
+            enforceBackpressure();
+            long sequenceId = commandRepository.insertSubmitCommand(clientOrderId, symbol, side, price, quantity);
+            if (tradingEnforced && userId == null) {
+                throw new SecurityException("Authenticated account required for funded trading");
+            }
+            if (userId != null) {
+                jdbcTemplate.update("INSERT INTO order_ownership (order_id, submit_sequence_id, user_id) VALUES (?, ?, ?)",
+                        clientOrderId, sequenceId, userId);
+                if (tradingEnforced) {
+                    clearingService.reserveForSubmission(clientOrderId, userId, symbol, side, price, quantity);
                 }
-                return new AdmissionResult(cmd.sequenceId(), true);
             }
-            throw e;
-        }
-
-        // Queue for execution
-        CommandRepository.CommandRecord cmd = new CommandRepository.CommandRecord(
-                sequenceId, "SUBMIT", clientOrderId, symbol, side, price, quantity, "PENDING"
-        );
-        queueCommand(cmd);
-
-        return new AdmissionResult(sequenceId, false);
+            return new AdmissionResult(sequenceId, false);
+        });
+        if (admitted == null) throw new IllegalStateException("Admission transaction returned no result");
+        if (!admitted.isDuplicate()) admissionSignal.release();
+        long admissionNanos = System.nanoTime() - admissionStart;
+        observe(o -> o.commandAdmitted("SUBMIT", admitted.isDuplicate(), admissionNanos));
+        return admitted;
     }
 
     /**
-     * Admit a CANCEL command to the durable journal.
-     * Throws RejectedExecutionException if command queue is full (backpressure).
+     * A SUBMIT exists durably before it exists in the orders projection. Accept
+     * a CANCEL for such a pending submit; the single writer will execute the
+     * SUBMIT first and then cancel any remaining resting quantity.
      */
     public AdmissionResult admitCancel(long clientOrderId) {
-        // Check queue capacity BEFORE journal admission (backpressure)
-        if (commandQueue.remainingCapacity() == 0) {
-            throw new RejectedExecutionException("Command queue full");
-        }
-
-        // Check for existing pending CANCEL
-        var existing = commandRepository.findPendingCancelByClientOrderId(clientOrderId, symbol);
-        if (existing.isPresent()) {
-            return new AdmissionResult(existing.get().sequenceId(), true);
-        }
-
-        // Check if order exists and is still active
-        var order = orderRepository.findByClientOrderId(clientOrderId);
-        if (order.isEmpty()) {
-            throw new IllegalArgumentException("Order not found: " + clientOrderId);
-        }
-        if (order.get().executionStatus().equals("CANCELLED") || order.get().executionStatus().equals("FILLED")) {
-            throw new IllegalArgumentException("Order already " + order.get().executionStatus().toLowerCase() + ": " + clientOrderId);
-        }
-
-        long sequenceId = commandRepository.insertCancelCommand(clientOrderId, symbol);
-
-        CommandRepository.CommandRecord cmd = new CommandRepository.CommandRecord(
-                sequenceId, "CANCEL", clientOrderId, symbol, null, null, null, "PENDING"
-        );
-        queueCommand(cmd);
-
-        return new AdmissionResult(sequenceId, false);
+        return admitCancelInternal(null, clientOrderId);
     }
 
-    private void queueCommand(CommandRepository.CommandRecord cmd) {
-        CompletableFuture<ExecutionResult> future = new CompletableFuture<>();
-        CommandTask task = new CommandTask(cmd, future);
-        try {
-            commandQueue.put(task);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            future.completeExceptionally(e);
+    /** Authenticated cancellation: checks ownership inside the serialized admission transaction. */
+    public AdmissionResult admitCancelForUser(long userId, long clientOrderId) {
+        if (userId <= 0) throw new SecurityException("Invalid account");
+        return admitCancelInternal(userId, clientOrderId);
+    }
+
+    private AdmissionResult admitCancelInternal(Long userId, long clientOrderId) {
+        long admissionStart = System.nanoTime();
+        ensureAcceptingCommands();
+        AdmissionResult admitted = transactionTemplate.execute(tx -> {
+            lockAdmissionTransaction();
+            if (tradingEnforced && userId == null) {
+                throw new SecurityException("Authenticated account required for funded trading");
+            }
+            if (userId != null) requireOrderOwner(clientOrderId, userId);
+            var existing = commandRepository.findPendingCancelByClientOrderId(clientOrderId, symbol);
+            if (existing.isPresent()) return new AdmissionResult(existing.get().sequenceId(), true);
+
+            var submit = commandRepository.findPendingSubmitByClientOrderId(clientOrderId, symbol);
+            if (submit.isEmpty()) throw new IllegalArgumentException("Order not found: " + clientOrderId);
+
+            var persisted = orderRepository.findByClientOrderId(clientOrderId);
+            if (persisted.isPresent()) {
+                String status = persisted.get().executionStatus();
+                if ("CANCELLED".equals(status) || "FILLED".equals(status)) {
+                    throw new IllegalArgumentException("Order already " + status.toLowerCase() + ": " + clientOrderId);
+                }
+            }
+            enforceBackpressure();
+            long sequenceId = commandRepository.insertCancelCommand(clientOrderId, symbol);
+            return new AdmissionResult(sequenceId, false);
+        });
+        if (admitted == null) throw new IllegalStateException("Admission transaction returned no result");
+        if (!admitted.isDuplicate()) admissionSignal.release();
+        long admissionNanos = System.nanoTime() - admissionStart;
+        observe(o -> o.commandAdmitted("CANCEL", admitted.isDuplicate(), admissionNanos));
+        return admitted;
+    }
+
+    /** Absence or mismatch is intentionally indistinguishable to avoid leaking another user's order. */
+    private void requireOrderOwner(long clientOrderId, long userId) {
+        List<Long> owners = jdbcTemplate.query(
+                "SELECT user_id FROM order_ownership WHERE order_id = ?",
+                (rs, row) -> rs.getLong(1), clientOrderId);
+        if (owners.isEmpty() || owners.get(0) != userId) {
+            throw new SecurityException("Order not found");
         }
     }
 
     // Public API for controller
+
+    public CompletableFuture<AdmissionResult> submitOrderForUser(long userId, long clientOrderId,
+            Side side, long price, long quantity) {
+        try {
+            return CompletableFuture.completedFuture(admitSubmitForUser(userId, clientOrderId, side, price, quantity));
+        } catch (Exception e) {
+            return CompletableFuture.failedFuture(e);
+        }
+    }
+
+    public CompletableFuture<AdmissionResult> cancelOrderForUser(long userId, long clientOrderId) {
+        try {
+            return CompletableFuture.completedFuture(admitCancelForUser(userId, clientOrderId));
+        } catch (Exception e) {
+            return CompletableFuture.failedFuture(e);
+        }
+    }
 
     public CompletableFuture<AdmissionResult> submitOrder(long clientOrderId, Side side, long price, long quantity) {
         try {
@@ -593,13 +838,11 @@ public class DurableCommandCoordinator implements AutoCloseable {
     }
 
     public CompletableFuture<BookSnapshot> snapshot() {
-        return CompletableFuture.completedFuture(
-                new BookSnapshot(matchingEngine.bestBid(), matchingEngine.bestAsk())
-        );
+        return CompletableFuture.completedFuture(publishedBook.get());
     }
 
     public CompletableFuture<List<Trade>> trades() {
-        return CompletableFuture.completedFuture(matchingEngine.trades());
+        return CompletableFuture.completedFuture(publishedTrades.get());
     }
 
     private CompletableFuture<ExecutionResult> getExecutionFuture(long sequenceId) {
@@ -651,6 +894,9 @@ public class DurableCommandCoordinator implements AutoCloseable {
     @Override
     public void close() {
         running.set(false);
+        observe(o -> o.coordinatorRunning(false));
+        admissionSignal.release();
+        if (executor == null || pollingScheduler == null) return;
         executor.shutdown();
         pollingScheduler.shutdown();
         try {
@@ -660,7 +906,6 @@ public class DurableCommandCoordinator implements AutoCloseable {
             if (!pollingScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
                 pollingScheduler.shutdownNow();
             }
-            shutdownLatch.await(5, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             executor.shutdownNow();
@@ -671,26 +916,6 @@ public class DurableCommandCoordinator implements AutoCloseable {
 
     // Inner classes
 
-    private static class CommandTask implements Runnable {
-        private final CommandRepository.CommandRecord command;
-        private final CompletableFuture<ExecutionResult> future;
-
-        CommandTask(CommandRepository.CommandRecord command, CompletableFuture<ExecutionResult> future) {
-            this.command = command;
-            this.future = future;
-        }
-
-        CommandRepository.CommandRecord command() { return command; }
-        void complete(ExecutionResult result) { future.complete(result); }
-        void completeExceptionally(Throwable t) { future.completeExceptionally(t); }
-
-        @Override
-        public void run() {
-            // This will be called by the executor thread
-            // The actual processing is done in processCommand
-        }
-    }
-
     record ExecutionResult(List<Trade> trades, List<OrderUpdate> orderUpdates, boolean isCancel, long sequenceId) {}
 
     record OrderUpdate(long clientOrderId, long remainingQuantity, String executionStatus) {
@@ -699,7 +924,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
         }
     }
 
-    record AdmissionResult(long sequenceId, boolean isDuplicate) {}
+    public record AdmissionResult(long sequenceId, boolean isDuplicate) {}
 
     public record BookSnapshot(
             Optional<OrderView> bestBid,

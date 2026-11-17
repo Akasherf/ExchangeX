@@ -47,11 +47,10 @@ import java.util.concurrent.TimeUnit;
  *
  * Run with: mvn -pl exchange-api -am -Dtest=DurableCommandCoordinatorRegressionTest -Dsurefire.failIfNoSpecifiedTests=false test
  */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, classes = ExchangeApiApplication.class)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, classes = ExchangeApiApplication.class, properties = "coordinator.auto-initialize=false")
 @AutoConfigureMockMvc
-@ActiveProfiles("postgres-integration")
+@ActiveProfiles(profiles = "postgres-integration", inheritProfiles = false)
 @EnabledIfEnvironmentVariable(named = "EXCHANGEX_TEST_DB_URL", matches = ".+")
-@Sql(scripts = "/test-cleanup.sql", executionPhase = Sql.ExecutionPhase.AFTER_TEST_METHOD)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_EACH_TEST_METHOD)
 class DurableCommandCoordinatorRegressionTest {
 
@@ -88,6 +87,26 @@ class DurableCommandCoordinatorRegressionTest {
             field.set(mockMvc, 60000L);
         } catch (Exception e) {
             // Ignore if field doesn't exist
+        }
+        // Clean database before each test for proper isolation
+        cleanDatabase();
+        // Initialize coordinator after cleanup (auto-initialize is disabled in test config)
+        coordinator.initialize();
+        waitForBackgroundProcessing(1000);
+    }
+
+    private void cleanDatabase() {
+        tradeRepository.deleteAll();
+        orderRepository.deleteAll();
+        commandRepository.deleteAll();
+        checkpointRepository.reset();
+    }
+
+    private void waitForBackgroundProcessing(long maxWaitMs) {
+        try {
+            Thread.sleep(maxWaitMs);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -219,10 +238,16 @@ class DurableCommandCoordinatorRegressionTest {
         mockMvc.perform(asyncDispatch(tradesResult))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$", hasSize(1)))
-                .andExpect(jsonPath("$[0].buyOrderId", is(buyId)))
-                .andExpect(jsonPath("$[0].sellOrderId", is(sellId)))
+                .andExpect(jsonPath("$[0].buyOrderId").doesNotExist())
+                .andExpect(jsonPath("$[0].sellOrderId").doesNotExist())
                 .andExpect(jsonPath("$[0].price", is(10000)))
                 .andExpect(jsonPath("$[0].quantity", is(6)));
+
+        // Keep verifying the exact counterparties in durable storage, not public market data.
+        var persistedTrades = tradeRepository.findBySymbol("AAPL");
+        assertEquals(1, persistedTrades.size());
+        assertEquals(buyId, persistedTrades.get(0).buyOrderId());
+        assertEquals(sellId, persistedTrades.get(0).sellOrderId());
 
         // Verify checkpoint advanced
         long checkpoint = checkpointRepository.getLastCompletedSequenceId("AAPL");
