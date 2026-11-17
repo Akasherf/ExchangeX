@@ -3,6 +3,10 @@ package com.exchangex.api;
 import com.exchangex.engine.OrderView;
 import com.exchangex.api.repository.OrderRepository;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import com.exchangex.engine.Side;
 import com.exchangex.engine.Trade;
 import jakarta.validation.Valid;
@@ -23,21 +27,52 @@ public class OrderController {
 
     private final DurableCommandCoordinator coordinator;
     private final OrderRepository orderRepository;
+    private final JdbcTemplate jdbcTemplate;
+    @Value("${exchangex.security.enabled:true}")
+    private boolean securityEnabled;
 
-    public OrderController(DurableCommandCoordinator coordinator, ObjectProvider<OrderRepository> repositories) {
+    public OrderController(DurableCommandCoordinator coordinator,
+            ObjectProvider<OrderRepository> repositories,
+            ObjectProvider<JdbcTemplate> jdbcTemplates) {
         this.coordinator = coordinator;
         this.orderRepository = repositories.getIfAvailable();
+        this.jdbcTemplate = jdbcTemplates.getIfAvailable();
+    }
+
+    private long authenticatedUserId(Jwt principal) {
+        if (principal == null) throw new ResponseStatusException(HttpStatus.UNAUTHORIZED);
+        try {
+            long id = Long.parseLong(principal.getSubject());
+            if (id > 0 && jdbcTemplate != null && !jdbcTemplate.query(
+                    "SELECT 1 FROM exchange_users WHERE id = ? AND enabled = TRUE",
+                    (rs, row) -> rs.getInt(1), id).isEmpty()) return id;
+        } catch (NumberFormatException ignored) { }
+        throw new ResponseStatusException(HttpStatus.UNAUTHORIZED);
+    }
+
+    private boolean ownedBy(long orderId, long userId) {
+        if (jdbcTemplate == null) return false;
+        return !jdbcTemplate.query("SELECT 1 FROM order_ownership WHERE order_id = ? AND user_id = ?",
+                (rs, row) -> rs.getInt(1), orderId, userId).isEmpty();
     }
 
     @PostMapping("/orders")
     public CompletableFuture<ResponseEntity<OrderSubmissionResponse>> submit(
-            @Valid @RequestBody OrderRequest request) {
+            @Valid @RequestBody OrderRequest request,
+            @AuthenticationPrincipal Jwt principal) {
 
-        return coordinator.submitOrder(request.id(), request.side(), request.price(), request.quantity())
-                .thenApply(admission -> ResponseEntity.status(HttpStatus.ACCEPTED)
-                        .body(new OrderSubmissionResponse("PENDING", admission.sequenceId())))
+        CompletableFuture<DurableCommandCoordinator.AdmissionResult> admission = securityEnabled
+                ? coordinator.submitOrderForUser(authenticatedUserId(principal), request.id(), request.side(), request.price(), request.quantity())
+                : coordinator.submitOrder(request.id(), request.side(), request.price(), request.quantity());
+        return admission
+                .thenApply(ack -> ResponseEntity.status(HttpStatus.ACCEPTED)
+                        .body(new OrderSubmissionResponse("PENDING", ack.sequenceId())))
                 .exceptionally(ex -> {
                     Throwable cause = ex instanceof CompletionException && ex.getCause() != null ? ex.getCause() : ex;
+                    if (cause instanceof SecurityException) {
+                        return ResponseEntity.status(HttpStatus.CONFLICT)
+                                .body(new OrderSubmissionResponse("CONFLICT", 0));
+                    }
                     if (cause instanceof IllegalArgumentException iae) {
                         if (iae.getMessage().contains("different payload")) {
                             return ResponseEntity.status(HttpStatus.CONFLICT)
@@ -66,13 +101,21 @@ public class OrderController {
 
     @DeleteMapping("/orders/{id}")
     public CompletableFuture<ResponseEntity<CancelResponse>> cancel(
-            @PathVariable("id") long id) {
+            @PathVariable("id") long id,
+            @AuthenticationPrincipal Jwt principal) {
 
-        return coordinator.cancelOrder(id)
-                .thenApply(admission -> ResponseEntity.status(HttpStatus.ACCEPTED)
+        CompletableFuture<DurableCommandCoordinator.AdmissionResult> admission = securityEnabled
+                ? coordinator.cancelOrderForUser(authenticatedUserId(principal), id)
+                : coordinator.cancelOrder(id);
+        return admission
+                .thenApply(ack -> ResponseEntity.status(HttpStatus.ACCEPTED)
                         .body(new CancelResponse("PENDING")))
                 .exceptionally(ex -> {
                     Throwable cause = ex instanceof CompletionException && ex.getCause() != null ? ex.getCause() : ex;
+                    if (cause instanceof SecurityException) {
+                        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                                .body(new CancelResponse("NOT_FOUND"));
+                    }
                     if (cause instanceof IllegalArgumentException iae) {
                         return ResponseEntity.status(HttpStatus.NOT_FOUND)
                                 .body(new CancelResponse("NOT_FOUND: " + iae.getMessage()));
@@ -97,8 +140,13 @@ public class OrderController {
 
     @GetMapping("/orders/{id}")
     public CompletableFuture<ResponseEntity<OrderStateResponse>> getOrder(
-            @PathVariable("id") long id) {
+            @PathVariable("id") long id,
+            @AuthenticationPrincipal Jwt principal) {
 
+        if (securityEnabled && !ownedBy(id, authenticatedUserId(principal))) {
+            return CompletableFuture.completedFuture(ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(new OrderStateResponse(id, null, 0, 0, "NOT_FOUND", 0)));
+        }
         if (orderRepository == null) {
             // Lightweight controller tests inject a mocked coordinator without a database.
             return coordinator.findOrder(id).thenApply(found -> found
@@ -126,15 +174,16 @@ public class OrderController {
         return coordinator.snapshot()
                 .thenApply(snapshot -> new OrderBookResponse(
                         symbol,
-                        snapshot.bestBid(),
-                        snapshot.bestAsk()
+                        snapshot.bestBid().map(v -> new MarketLevel(v.price(), v.remainingQuantity())),
+                        snapshot.bestAsk().map(v -> new MarketLevel(v.price(), v.remainingQuantity()))
                 ));
     }
 
     @GetMapping("/trades")
-    public CompletableFuture<ResponseEntity<List<Trade>>> trades() {
+    public CompletableFuture<ResponseEntity<List<MarketTrade>>> trades() {
         return coordinator.trades()
-                .thenApply(ResponseEntity::ok);
+                .thenApply(items -> ResponseEntity.ok(items.stream()
+                        .map(t -> new MarketTrade(t.price(), t.quantity())).toList()));
     }
 
     // Response DTOs
@@ -152,9 +201,13 @@ public class OrderController {
             long sequenceId
     ) {}
 
+    /** Public market data excludes client and counterparty order identifiers. */
+    public record MarketLevel(long price, long remainingQuantity) {}
+    public record MarketTrade(long price, long quantity) {}
+
     public record OrderBookResponse(
             String symbol,
-            Optional<OrderView> bestBid,
-            Optional<OrderView> bestAsk
+            Optional<MarketLevel> bestBid,
+            Optional<MarketLevel> bestAsk
     ) {}
 }

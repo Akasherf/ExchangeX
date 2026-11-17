@@ -622,14 +622,32 @@ public class DurableCommandCoordinator implements AutoCloseable {
     }
 
     public AdmissionResult admitSubmit(long clientOrderId, Side side, long price, long quantity) {
+        return admitSubmitInternal(null, clientOrderId, side, price, quantity);
+    }
+
+    /** Authenticated admission: owner is recorded atomically with the SUBMIT journal row. */
+    public AdmissionResult admitSubmitForUser(long userId, long clientOrderId, Side side, long price, long quantity) {
+        if (userId <= 0) throw new SecurityException("Invalid account");
+        return admitSubmitInternal(userId, clientOrderId, side, price, quantity);
+    }
+
+    private AdmissionResult admitSubmitInternal(Long userId, long clientOrderId, Side side, long price, long quantity) {
         long admissionStart = System.nanoTime();
         ensureAcceptingCommands();
         AdmissionResult admitted = transactionTemplate.execute(tx -> {
             lockAdmissionTransaction();
+            // Protect ownership even on idempotent retries (global client IDs are unique).
+            if (userId != null && commandRepository.findPendingSubmitByClientOrderId(clientOrderId, symbol).isPresent()) {
+                requireOrderOwner(clientOrderId, userId);
+            }
             AdmissionResult prior = existingSubmitOrNull(clientOrderId, side, price, quantity);
             if (prior != null) return prior;
             enforceBackpressure();
             long sequenceId = commandRepository.insertSubmitCommand(clientOrderId, symbol, side, price, quantity);
+            if (userId != null) {
+                jdbcTemplate.update("INSERT INTO order_ownership (order_id, submit_sequence_id, user_id) VALUES (?, ?, ?)",
+                        clientOrderId, sequenceId, userId);
+            }
             return new AdmissionResult(sequenceId, false);
         });
         if (admitted == null) throw new IllegalStateException("Admission transaction returned no result");
@@ -645,10 +663,21 @@ public class DurableCommandCoordinator implements AutoCloseable {
      * SUBMIT first and then cancel any remaining resting quantity.
      */
     public AdmissionResult admitCancel(long clientOrderId) {
+        return admitCancelInternal(null, clientOrderId);
+    }
+
+    /** Authenticated cancellation: checks ownership inside the serialized admission transaction. */
+    public AdmissionResult admitCancelForUser(long userId, long clientOrderId) {
+        if (userId <= 0) throw new SecurityException("Invalid account");
+        return admitCancelInternal(userId, clientOrderId);
+    }
+
+    private AdmissionResult admitCancelInternal(Long userId, long clientOrderId) {
         long admissionStart = System.nanoTime();
         ensureAcceptingCommands();
         AdmissionResult admitted = transactionTemplate.execute(tx -> {
             lockAdmissionTransaction();
+            if (userId != null) requireOrderOwner(clientOrderId, userId);
             var existing = commandRepository.findPendingCancelByClientOrderId(clientOrderId, symbol);
             if (existing.isPresent()) return new AdmissionResult(existing.get().sequenceId(), true);
 
@@ -673,7 +702,34 @@ public class DurableCommandCoordinator implements AutoCloseable {
         return admitted;
     }
 
+    /** Absence or mismatch is intentionally indistinguishable to avoid leaking another user's order. */
+    private void requireOrderOwner(long clientOrderId, long userId) {
+        List<Long> owners = jdbcTemplate.query(
+                "SELECT user_id FROM order_ownership WHERE order_id = ?",
+                (rs, row) -> rs.getLong(1), clientOrderId);
+        if (owners.isEmpty() || owners.get(0) != userId) {
+            throw new SecurityException("Order not found");
+        }
+    }
+
     // Public API for controller
+
+    public CompletableFuture<AdmissionResult> submitOrderForUser(long userId, long clientOrderId,
+            Side side, long price, long quantity) {
+        try {
+            return CompletableFuture.completedFuture(admitSubmitForUser(userId, clientOrderId, side, price, quantity));
+        } catch (Exception e) {
+            return CompletableFuture.failedFuture(e);
+        }
+    }
+
+    public CompletableFuture<AdmissionResult> cancelOrderForUser(long userId, long clientOrderId) {
+        try {
+            return CompletableFuture.completedFuture(admitCancelForUser(userId, clientOrderId));
+        } catch (Exception e) {
+            return CompletableFuture.failedFuture(e);
+        }
+    }
 
     public CompletableFuture<AdmissionResult> submitOrder(long clientOrderId, Side side, long price, long quantity) {
         try {

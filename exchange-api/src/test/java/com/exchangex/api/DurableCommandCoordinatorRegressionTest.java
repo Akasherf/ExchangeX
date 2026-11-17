@@ -238,10 +238,16 @@ class DurableCommandCoordinatorRegressionTest {
         mockMvc.perform(asyncDispatch(tradesResult))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$", hasSize(1)))
-                .andExpect(jsonPath("$[0].buyOrderId", is(buyId)))
-                .andExpect(jsonPath("$[0].sellOrderId", is(sellId)))
+                .andExpect(jsonPath("$[0].buyOrderId").doesNotExist())
+                .andExpect(jsonPath("$[0].sellOrderId").doesNotExist())
                 .andExpect(jsonPath("$[0].price", is(10000)))
                 .andExpect(jsonPath("$[0].quantity", is(6)));
+
+        // Keep verifying the exact counterparties in durable storage, not public market data.
+        var persistedTrades = tradeRepository.findBySymbol("AAPL");
+        assertEquals(1, persistedTrades.size());
+        assertEquals(buyId, persistedTrades.get(0).buyOrderId());
+        assertEquals(sellId, persistedTrades.get(0).sellOrderId());
 
         // Verify checkpoint advanced
         long checkpoint = checkpointRepository.getLastCompletedSequenceId("AAPL");
