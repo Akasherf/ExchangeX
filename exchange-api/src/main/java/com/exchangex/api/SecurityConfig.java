@@ -48,6 +48,9 @@ public class SecurityConfig {
         if (enabled) {
             http.authorizeHttpRequests(a -> a
                     .requestMatchers(HttpMethod.POST, "/api/v1/auth/register", "/api/v1/auth/login").permitAll()
+                    // The WebSocket handshake may be anonymous; STOMP subscriptions are
+                    // authorized separately on the inbound messaging channel.
+                    .requestMatchers(HttpMethod.GET, "/ws", "/ws/**", "/api/v1/market/**").permitAll()
                     .requestMatchers(HttpMethod.GET, "/api/v1/orderbook/**", "/api/v1/trades",
                             "/api/v1/instruments", "/api/v1/instruments/*/trades",
                             "/actuator/health", "/actuator/info").permitAll()
