@@ -30,6 +30,7 @@ import java.util.List;
 public class StreamInboundAuth implements ChannelInterceptor {
     private final ObjectProvider<JwtDecoder> decoder;
     private final JdbcTemplate jdbc;
+    private final StreamTrafficGuard traffic = new StreamTrafficGuard();
 
     public StreamInboundAuth(ObjectProvider<JwtDecoder> decoder, JdbcTemplate jdbc) {
         this.decoder = decoder;
@@ -41,9 +42,19 @@ public class StreamInboundAuth implements ChannelInterceptor {
         StompHeaderAccessor headers = MessageHeaderAccessor.getAccessor(message, StompHeaderAccessor.class);
         if (headers == null || headers.getCommand() == null) return message;
         StompCommand command = headers.getCommand();
+        String session = headers.getSessionId();
+        if (session == null || session.isBlank() || session.length() > 256)
+            throw new SecurityException("Invalid STOMP session");
+        if (headers.getDestination() != null && headers.getDestination().length() > 128)
+            throw new SecurityException("STOMP destination too long");
+        if (command == StompCommand.DISCONNECT) {
+            traffic.onDisconnect(session);
+            return message;
+        }
         if (command == StompCommand.CONNECT) {
             String bearer = headers.getFirstNativeHeader("Authorization");
             if (bearer != null) {
+                if (bearer.length() > 4096) throw new SecurityException("STOMP token too long");
                 if (!bearer.startsWith("Bearer ") || bearer.length() <= 7) {
                     throw new SecurityException("Invalid STOMP Authorization header");
                 }
@@ -59,22 +70,35 @@ public class StreamInboundAuth implements ChannelInterceptor {
                     throw new SecurityException("Invalid or expired token", e);
                 }
             }
+            // Only count sessions after JWT verification succeeds.
+            traffic.onConnect(session);
             return message;
         }
+        int frameSize = message.getPayload() instanceof byte[] bytes ? bytes.length
+                : message.getPayload() instanceof String body
+                    ? body.getBytes(java.nio.charset.StandardCharsets.UTF_8).length : 0;
+        traffic.onFrame(session, frameSize);
         if (command == StompCommand.SUBSCRIBE) {
             String destination = headers.getDestination();
             if (StreamDestinationPolicy.isPublicMarket(destination)) {
                 String symbol = destination.substring("/topic/market/".length());
                 if (Boolean.TRUE.equals(jdbc.queryForObject(
                         "SELECT EXISTS(SELECT 1 FROM instruments WHERE symbol=? AND active=TRUE)",
-                        Boolean.class, symbol))) return message;
+                        Boolean.class, symbol))) {
+                    traffic.onSubscribe(session, headers.getSubscriptionId());
+                    return message;
+                }
             }
             if (StreamDestinationPolicy.isPrivateOrders(destination) && authenticated(headers.getUser())) {
+                traffic.onSubscribe(session, headers.getSubscriptionId());
                 return message;
             }
             throw new SecurityException("Subscription not authorized");
         }
-        if (command == StompCommand.UNSUBSCRIBE || command == StompCommand.DISCONNECT) return message;
+        if (command == StompCommand.UNSUBSCRIBE) {
+            traffic.onUnsubscribe(session, headers.getSubscriptionId());
+            return message;
+        }
         // No client publishing to /topic, /queue or /app. REST performs all trading actions.
         throw new SecurityException("Client STOMP command not allowed");
     }
