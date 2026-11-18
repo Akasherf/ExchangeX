@@ -1,0 +1,101 @@
+name: exchangex
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: exchangex
+      POSTGRES_USER: exchangex
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Create .env with scripts/init-local-env.sh}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U exchangex -d exchangex"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: exchange-api/Dockerfile
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_URL: jdbc:postgresql://db:5432/exchangex
+      DB_USERNAME: exchangex
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?Create .env first}
+      EXCHANGEX_JWT_SECRET_BASE64: ${EXCHANGEX_JWT_SECRET_BASE64:?Create .env first}
+      EXCHANGEX_STREAM_ALLOWED_ORIGINS: http://localhost:8088,http://127.0.0.1:8088
+      JAVA_TOOL_OPTIONS: -XX:MaxRAMPercentage=70.0
+    ports:
+      - '127.0.0.1:8085:8085'
+    networks: [data, frontend, monitoring]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8085/api/v1/instruments"]
+      interval: 10s
+      timeout: 5s
+      start_period: 45s
+      retries: 12
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: exchange-web/Dockerfile
+    ports:
+      - '127.0.0.1:8088:8080'
+    networks: [frontend]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - '127.0.0.1:9091:9090'
+    networks: [monitoring]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.4.15
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Create .env first}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_AUTH_ANONYMOUS_ENABLED: 'false'
+      GF_METRICS_ENABLED: 'false'
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - '127.0.0.1:3000:3000'
+    networks: [monitoring]
+    depends_on: [prometheus]
+    restart: unless-stopped
+
+networks:
+  data:
+    internal: true
+  frontend: {}
+  monitoring: {}
+volumes:
+  postgres_data: {}
+  prometheus_data: {}
+  grafana_data: {}

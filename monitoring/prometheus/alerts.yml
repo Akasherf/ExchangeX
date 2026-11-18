@@ -1,0 +1,17 @@
+groups:
+  - name: exchangex-local
+    rules:
+      - alert: ExchangeXApiMetricsUnavailable
+        expr: up{job="exchangex-api"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ExchangeX metrics scrape has failed for 2 minutes"
+      - alert: ExchangeXHighHttp5xxRate
+        expr: sum(rate(http_server_requests_seconds_count{job="exchangex-api",status=~"5.."}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ExchangeX HTTP 5xx rate is over 0.1/s"
