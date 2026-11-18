@@ -4,7 +4,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 import sys
 
-MIN_TESTS = 92  # 12 matching-engine + 80 exchange-api at Sprint 5 (Sprint 6 adds one)
+MIN_TESTS = 98  # Sprint 5: 92; Sprint 6: +1; Sprint 7A: +5 funded-trading checks
 roots = (Path('matching-engine/target/surefire-reports'), Path('exchange-api/target/surefire-reports'))
 files = [p for root in roots for p in root.glob('TEST-*.xml')]
 if not files:

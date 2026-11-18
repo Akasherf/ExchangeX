@@ -81,6 +81,8 @@ jobs:
         run: docker compose up --build -d --wait --wait-timeout 240
       - name: Smoke-test UI, API, Prometheus and Grafana
         run: bash scripts/smoke-compose.sh
+      - name: Verify financial ledger and reservation invariants
+        run: bash scripts/audit-financial-invariants.sh
       - name: Logs on failure
         if: failure()
         run: docker compose logs --no-color --tail=180

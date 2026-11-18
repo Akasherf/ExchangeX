@@ -120,6 +120,84 @@ class FundedTradingIntegrationTest {
     }
 
     @Test
+    void sameAccountCrossingRestingOrderIsRejectedWithoutJournalOrLedgerMutation() {
+        long user = newUser();
+        accounts.creditSimulation(user, 2_000, "seed:cash");
+        accounts.grantSimulationHolding(user, "AAPL", 5, "seed:holding");
+        long sellSequence = submit(user, 902101, Side.SELL, 90, 5);
+        committed(sellSequence);
+
+        assertThrows(TradingClearingService.SelfTradePreventedException.class,
+                () -> submit(user, 902102, Side.BUY, 100, 2));
+        assertTrue(commands.findPendingSubmitByClientOrderId(902102, "AAPL").isEmpty());
+        assertEquals(0L, jdbc.queryForObject(
+                "SELECT COUNT(*) FROM order_ownership WHERE order_id=?", Long.class, 902102));
+        assertEquals(0L, jdbc.queryForObject(
+                "SELECT COUNT(*) FROM trading_order_reservations WHERE order_id=?", Long.class, 902102));
+        assertEquals(new AccountLedger.CashBalance(2000, 0), accounts.cashBalance(user));
+        assertEquals(new AccountLedger.Holding("AAPL", 0, 5), accounts.holdings(user).getFirst());
+        assertEquals(0L, jdbc.queryForObject("SELECT COUNT(*) FROM trades", Long.class));
+    }
+
+    @Test
+    void sameAccountCrossingSellAgainstOwnBidIsRejected() {
+        long user = newUser();
+        accounts.creditSimulation(user, 1000, "seed:cash");
+        accounts.grantSimulationHolding(user, "AAPL", 3, "seed:holding");
+        committed(submit(user, 902151, Side.BUY, 110, 2));
+        assertThrows(TradingClearingService.SelfTradePreventedException.class,
+                () -> submit(user, 902152, Side.SELL, 100, 1));
+        assertTrue(commands.findPendingSubmitByClientOrderId(902152, "AAPL").isEmpty());
+        assertEquals(new AccountLedger.CashBalance(780, 220), accounts.cashBalance(user));
+        assertEquals(new AccountLedger.Holding("AAPL", 3, 0), accounts.holdings(user).getFirst());
+        assertEquals(0L, jdbc.queryForObject("SELECT COUNT(*) FROM trades", Long.class));
+    }
+
+    @Test
+    void sameAccountNonCrossingOrdersAreAllowedAndCancellingReleasesBoth() {
+        long user = newUser();
+        accounts.creditSimulation(user, 1000, "seed:cash");
+        accounts.grantSimulationHolding(user, "AAPL", 5, "seed:holding");
+        long buy = submit(user, 902201, Side.BUY, 90, 2);
+        long sell = submit(user, 902202, Side.SELL, 100, 3);
+        committed(buy);
+        committed(sell);
+        assertEquals(new AccountLedger.CashBalance(820, 180), accounts.cashBalance(user));
+        assertEquals(new AccountLedger.Holding("AAPL", 2, 3), accounts.holdings(user).getFirst());
+        assertEquals(0L, jdbc.queryForObject("SELECT COUNT(*) FROM trades", Long.class));
+        committed(coordinator.admitCancelForUser(user, 902201).sequenceId());
+        committed(coordinator.admitCancelForUser(user, 902202).sequenceId());
+        assertEquals(new AccountLedger.CashBalance(1000, 0), accounts.cashBalance(user));
+        assertEquals(new AccountLedger.Holding("AAPL", 5, 0), accounts.holdings(user).getFirst());
+    }
+
+    @Test
+    void pendingOwnOppositeSubmitAlsoPreventsCrossingBeforeProjection() {
+        long user = newUser();
+        accounts.creditSimulation(user, 1000, "seed:cash");
+        accounts.grantSimulationHolding(user, "AAPL", 5, "seed:holding");
+        // The worker may finish before the second call; either the pending
+        // journal or the resting order projection must trigger the guard.
+        submit(user, 902301, Side.SELL, 90, 3);
+        assertThrows(TradingClearingService.SelfTradePreventedException.class,
+                () -> submit(user, 902302, Side.BUY, 100, 1));
+        assertTrue(commands.findPendingSubmitByClientOrderId(902302, "AAPL").isEmpty());
+    }
+
+    @Test
+    void oppositeSideFromDifferentAccountCanStillMatch() {
+        long buyer = newUser();
+        long seller = newUser();
+        accounts.creditSimulation(buyer, 1000, "seed:cash");
+        accounts.grantSimulationHolding(seller, "AAPL", 3, "seed:holding");
+        committed(submit(seller, 902401, Side.SELL, 90, 3));
+        committed(submit(buyer, 902402, Side.BUY, 100, 2));
+        assertEquals(1L, jdbc.queryForObject("SELECT COUNT(*) FROM trades", Long.class));
+        assertEquals(new AccountLedger.CashBalance(820, 0), accounts.cashBalance(buyer));
+        assertEquals(new AccountLedger.CashBalance(180, 0), accounts.cashBalance(seller));
+    }
+
+    @Test
     void duplicateSubmissionDoesNotReserveTwiceAndConflictingPayloadFails() {
         long buyer = newUser();
         accounts.creditSimulation(buyer, 1000, "seed");
