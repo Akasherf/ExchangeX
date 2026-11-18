@@ -1,6 +1,7 @@
 package com.exchangex.api;
 
 import com.exchangex.api.accounts.TradingClearingService;
+import com.exchangex.api.guard.WriterLease;
 import com.exchangex.api.repository.CheckpointRepository;
 import com.exchangex.api.repository.CommandRepository;
 import com.exchangex.api.repository.OrderRepository;
@@ -35,6 +36,7 @@ public class SymbolCoordinatorRegistry {
     private final JdbcTemplate jdbc;
     private final TransactionTemplate tx;
     private final TradingClearingService clearing;
+    private final WriterLease writerLease;
     private final Map<String, DurableCommandCoordinator> other = new HashMap<>();
     private boolean started;
 
@@ -44,7 +46,8 @@ public class SymbolCoordinatorRegistry {
     public SymbolCoordinatorRegistry(DurableCommandCoordinator primary, CommandRepository commands,
             OrderRepository orders, TradeRepository trades, CheckpointRepository checkpoints,
             JdbcTemplate jdbc, TransactionTemplate tx,
-            org.springframework.beans.factory.ObjectProvider<TradingClearingService> clearingProvider) {
+            org.springframework.beans.factory.ObjectProvider<TradingClearingService> clearingProvider,
+            WriterLease writerLease) {
         this.primary = primary;
         this.commands = commands;
         this.orders = orders;
@@ -53,6 +56,7 @@ public class SymbolCoordinatorRegistry {
         this.jdbc = jdbc;
         this.tx = tx;
         this.clearing = clearingProvider.getIfAvailable();
+        this.writerLease = writerLease;
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -64,6 +68,7 @@ public class SymbolCoordinatorRegistry {
             var worker = new DurableCommandCoordinator(symbol, new MatchingEngine(symbol),
                     commands, orders, trades, checkpoints, jdbc, tx, null);
             worker.configureTrading(clearing, tradingEnforced);
+            worker.setWriterLease(writerLease);
             worker.initialize();
             other.put(symbol, worker);
         }

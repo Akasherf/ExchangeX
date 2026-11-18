@@ -22,9 +22,19 @@ class StreamInboundAuthTest {
     private final MessageChannel channel = mock(MessageChannel.class);
     private final StreamInboundAuth interceptor = new StreamInboundAuth(decoder, jdbc);
 
+    private void connect() {
+        var headers = StompHeaderAccessor.create(StompCommand.CONNECT);
+        headers.setSessionId("test-session");
+        headers.setLeaveMutable(true);
+        interceptor.preSend(MessageBuilder.createMessage(new byte[0], headers.getMessageHeaders()), channel);
+    }
+
     private Message<byte[]> subscribe(String destination, boolean signedIn) {
+        connect();
         var headers = StompHeaderAccessor.create(StompCommand.SUBSCRIBE);
         headers.setDestination(destination);
+        headers.setSessionId("test-session");
+        headers.setSubscriptionId("sub-1");
         if (signedIn) headers.setUser(new UsernamePasswordAuthenticationToken("42", null));
         headers.setLeaveMutable(true);
         return MessageBuilder.createMessage(new byte[0], headers.getMessageHeaders());
@@ -58,6 +68,7 @@ class StreamInboundAuthTest {
     void clientCannotPublishToAnyBrokerDestination() {
         var headers = StompHeaderAccessor.create(StompCommand.SEND);
         headers.setDestination("/topic/market/AAPL");
+        headers.setSessionId("test-session");
         headers.setLeaveMutable(true);
         var message = MessageBuilder.createMessage(new byte[0], headers.getMessageHeaders());
         assertThrows(SecurityException.class, () -> interceptor.preSend(message, channel));

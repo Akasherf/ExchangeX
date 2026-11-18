@@ -1,6 +1,7 @@
 package com.exchangex.api;
 
 import com.exchangex.api.accounts.TradingClearingService;
+import com.exchangex.api.guard.WriterLease;
 import com.exchangex.api.repository.CheckpointRepository;
 import com.exchangex.api.repository.CommandRepository;
 import com.exchangex.api.repository.OrderRepository;
@@ -62,6 +63,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
     @Nullable private TradingClearingService clearingService;
     @Value("${exchangex.trading.enforced:true}")
     private boolean tradingEnforced;
+    @Nullable private WriterLease writerLease;
     private MatchingEngine matchingEngine;
     private final CommandRepository commandRepository;
     private final OrderRepository orderRepository;
@@ -99,6 +101,15 @@ public class DurableCommandCoordinator implements AutoCloseable {
     @Autowired(required = false)
     public void setClearingService(TradingClearingService clearing) {
         this.clearingService = clearing;
+    }
+
+    @Autowired(required = false)
+    public void setWriterLease(WriterLease lease) {
+        this.writerLease = lease;
+    }
+
+    private void fenceTransaction() {
+        if (writerLease != null) writerLease.assertFencedTransaction();
     }
 
     /** Optional, best-effort telemetry. Never participates in transaction decisions. */
@@ -472,6 +483,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
      */
     protected void commitResults(long sequenceId, List<Trade> trades, List<OrderUpdate> orderUpdates, boolean isCancel) {
         transactionTemplate.executeWithoutResult(txStatus -> {
+            fenceTransaction();
             // 1. Handle orders FIRST - INSERT new orders for SUBMIT, UPDATE for both SUBMIT and CANCEL
             // This must happen before trade insert to satisfy FK constraints (trades reference orders)
             for (OrderUpdate update : orderUpdates) {
@@ -649,6 +661,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
      * sequence 101 could commit and execute before an uncommitted sequence 100.
      */
     private void lockAdmissionTransaction() {
+        fenceTransaction();
         jdbcTemplate.query("SELECT pg_advisory_xact_lock(?, hashtext(?))",
                 rs -> { /* wait for lock, no result to map */ }, ADMISSION_LOCK_NAMESPACE, symbol);
     }
