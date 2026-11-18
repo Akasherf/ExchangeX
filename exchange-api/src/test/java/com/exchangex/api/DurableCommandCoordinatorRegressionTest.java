@@ -14,8 +14,6 @@ import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
-import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.jdbc.Sql;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.web.servlet.MockMvc;
@@ -72,11 +70,6 @@ class DurableCommandCoordinatorRegressionTest {
     @Autowired
     private DurableCommandCoordinator coordinator;
 
-    @DynamicPropertySource
-    static void configureProperties(DynamicPropertyRegistry registry) {
-        // Disable Flyway auto-configuration - let the profile handle it
-        registry.add("spring.flyway.enabled", () -> "false");
-    }
 
     @BeforeEach
     void setAsyncTimeout() {

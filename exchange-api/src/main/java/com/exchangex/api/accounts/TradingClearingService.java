@@ -85,6 +85,46 @@ public class TradingClearingService {
         }
     }
 
+    /**
+     * Reject an incoming order that would cross this account's own existing order.
+     *
+     * The caller holds the transaction-scoped, per-symbol admission advisory lock.
+     * Search BOTH the committed order projection and as-yet-unexecuted SUBMIT
+     * commands: a fast second admission can precede the first order projection.
+     * An accepted but unexecuted CANCEL is deliberately not considered final.
+     *
+     * There is no HTTP/admin override. This check must remain enabled for
+     * funded trading, and settlement also verifies buyer != seller.
+     */
+    private void rejectSelfCross(long userId, String symbol, Side incomingSide, long incomingPrice) {
+        String opposite = incomingSide == Side.BUY ? "SELL" : "BUY";
+        String priceComparison = incomingSide == Side.BUY ? "<=" : ">=";
+        // c is the original durable SUBMIT. o is an optional materialized state.
+        // If o is absent, only pending SUBMITs are considered live.
+        String sql = """
+                SELECT EXISTS (
+                  SELECT 1 FROM order_ownership owner
+                  JOIN exchange_commands c ON c.sequence_id = owner.submit_sequence_id
+                  LEFT JOIN orders o ON o.order_id = owner.order_id
+                  WHERE owner.user_id = ? AND c.symbol = ? AND c.command_type = 'SUBMIT'
+                    AND c.side = ? AND c.price %s ?
+                    AND (
+                      (o.order_id IS NULL AND c.status = 'PENDING')
+                      OR (o.order_id IS NOT NULL AND o.execution_status IN ('PENDING','PARTIAL')
+                          AND o.remaining_quantity > 0)
+                    )
+                )
+                """.formatted(priceComparison);
+        Boolean crossing = jdbc.queryForObject(sql, Boolean.class, userId, symbol, opposite, incomingPrice);
+        if (Boolean.TRUE.equals(crossing)) {
+            throw new SelfTradePreventedException("Order would cross the account's own resting or pending order");
+        }
+    }
+
+    public static final class SelfTradePreventedException extends IllegalArgumentException {
+        public SelfTradePreventedException(String message) { super(message); }
+    }
+
     /** Called after journal and order_ownership are written, in the same admission TX. */
     public void reserveForSubmission(long orderId, long userId, String symbol, Side side,
                                      long price, long quantity) {
@@ -99,6 +139,8 @@ public class TradingClearingService {
         Boolean active = jdbc.queryForObject("SELECT EXISTS (SELECT 1 FROM instruments WHERE symbol=? AND active=TRUE)",
                 Boolean.class, symbol);
         if (!Boolean.TRUE.equals(active)) throw new IllegalArgumentException("Inactive instrument");
+        // No financial mutation occurs until the self-cross check passes.
+        rejectSelfCross(userId, symbol, side, price);
         if (side == Side.BUY) {
             accounts.applyCash(userId, "order:" + orderId + ":reserve", "RESERVE", -notional, notional);
         } else if (side == Side.SELL) {
@@ -126,6 +168,9 @@ public class TradingClearingService {
         Long seller = jdbc.queryForObject("SELECT user_id FROM trading_order_reservations WHERE order_id=?",
                 Long.class, trade.sellOrderId());
         if (buyer == null || seller == null) throw new IllegalStateException("Unfunded counterparty");
+        // Defensive check against historical orders, disabled admission guards,
+        // corrupted journals, or future code paths that bypass order admission.
+        if (buyer.equals(seller)) throw new IllegalStateException("Self-trade settlement blocked");
         lockAccounts(buyer, seller);
         Reservation buy = reservation(trade.buyOrderId());
         Reservation sell = reservation(trade.sellOrderId());

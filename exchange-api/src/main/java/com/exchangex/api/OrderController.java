@@ -100,6 +100,10 @@ public class OrderController {
                         return ResponseEntity.status(HttpStatus.CONFLICT)
                                 .body(new OrderSubmissionResponse("CONFLICT", 0));
                     }
+                    if (cause instanceof com.exchangex.api.accounts.TradingClearingService.SelfTradePreventedException) {
+                        return ResponseEntity.status(HttpStatus.CONFLICT)
+                                .body(new OrderSubmissionResponse("SELF_TRADE_PREVENTED", 0));
+                    }
                     if (cause instanceof IllegalArgumentException iae) {
                         if (iae.getMessage().contains("different payload") || iae.getMessage().contains("different instrument")) {
                             return ResponseEntity.status(HttpStatus.CONFLICT)

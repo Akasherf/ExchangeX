@@ -15,8 +15,6 @@ import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
-import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.jdbc.Sql;
 import org.springframework.test.web.servlet.MockMvc;
@@ -69,11 +67,6 @@ class CrashRecoveryIntegrationTest {
     @Autowired
     private DurableCommandCoordinator coordinator;
 
-    @DynamicPropertySource
-    static void configureProperties(DynamicPropertyRegistry registry) {
-        // Disable Flyway auto-configuration - let the profile handle it
-        registry.add("spring.flyway.enabled", () -> "false");
-    }
 
     @BeforeEach
     void setAsyncTimeout() {
@@ -285,29 +278,36 @@ class CrashRecoveryIntegrationTest {
                         .content(orderJson))
                 .andExpect(request().asyncStarted())
                 .andReturn();
-        mockMvc.perform(asyncDispatch(first))
-                .andExpect(status().isAccepted());
+        MvcResult firstAck = mockMvc.perform(asyncDispatch(first))
+                .andExpect(status().isAccepted())
+                .andReturn();
 
-        // Retry with same payload
+        // Retry with the identical payload after the initial admission.
         MvcResult second = mockMvc.perform(post("/api/v1/orders")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(orderJson))
                 .andExpect(request().asyncStarted())
                 .andReturn();
-        mockMvc.perform(asyncDispatch(second))
-                .andExpect(status().isAccepted());
+        MvcResult secondAck = mockMvc.perform(asyncDispatch(second))
+                .andExpect(status().isAccepted())
+                .andReturn();
 
-        // Both should return the same sequence_id (idempotent)
-        // We can't easily extract sequence_id from the response in this test,
-        // but the PostgreSQLIntegrationTest covers this.
+        // Duplicate admission must acknowledge the same durable sequence.
+        assertEquals(firstAck.getResponse().getContentAsString(),
+                secondAck.getResponse().getContentAsString(),
+                "Retry must acknowledge the original command sequence");
 
-        // Verify only one command exists in journal
-        var pending = commandRepository.findPendingSubmitByClientOrderId(orderId, "AAPL");
-        assertTrue(pending.isPresent());
-
-        // Verify only one order exists in orders table
-        var orderRecord = orderRepository.findByClientOrderId(orderId);
-        assertTrue(orderRecord.isPresent());
+        // An accepted command is durable, but execution is asynchronous.
+        var admitted = commandRepository.findPendingSubmitByClientOrderId(orderId, "AAPL")
+                .orElseThrow(() -> new AssertionError("SUBMIT command missing from durable journal"));
+        await().atMost(30, TimeUnit.SECONDS)
+                .pollInterval(200, TimeUnit.MILLISECONDS)
+                .untilAsserted(() -> {
+                    var persisted = orderRepository.findByClientOrderId(orderId);
+                    assertTrue(persisted.isPresent(), "Accepted order must eventually be persisted");
+                    assertEquals(admitted.sequenceId(), persisted.get().exchangeSequenceId(),
+                            "Persisted order must reference the original SUBMIT sequence");
+                });
     }
 
     @Test
