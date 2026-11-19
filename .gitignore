@@ -19,3 +19,7 @@ target/
 application-local.properties
 application-local.yml
 /docs/
+
+# Python generated files
+__pycache__/
+*.py[cod]
