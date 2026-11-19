@@ -797,6 +797,11 @@ public class DurableCommandCoordinator implements AutoCloseable {
         }
     }
 
+    /** False if processing stopped, irrespective of HTTP/data-source health. */
+    public boolean isRunning() {
+        return running.get();
+    }
+
     // Public API for controller
 
     public CompletableFuture<AdmissionResult> submitOrderForUser(long userId, long clientOrderId,
