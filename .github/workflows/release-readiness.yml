@@ -38,6 +38,11 @@ jobs:
           archive="$(find backups -maxdepth 1 -type f -name 'exchangex_*.dump' -print -quit)"
           test -n "$archive"
           bash scripts/verify-backup.sh "$archive"
+      - name: Diagnose management readiness on failure
+        if: failure()
+        run: |
+          docker compose ps -a || true
+          docker compose exec -T api sh -c 'curl -sS -i --max-time 8 http://127.0.0.1:9090/actuator/health/readiness || true' || true
       - name: Inspect Docker logs on failure
         if: failure()
         run: docker compose logs --no-color --tail=160
