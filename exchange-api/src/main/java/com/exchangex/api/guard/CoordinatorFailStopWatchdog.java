@@ -37,6 +37,7 @@ public final class CoordinatorFailStopWatchdog implements AutoCloseable {
                 return thread;
             });
 
+    @org.springframework.beans.factory.annotation.Autowired
     public CoordinatorFailStopWatchdog(SymbolCoordinatorRegistry registry, WriterLease lease) {
         this(registry, lease, () -> System.exit(42));
     }
