@@ -1,0 +1,48 @@
+name: ExchangeX release readiness
+on:
+  push:
+    branches: [main, 'feature/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release-readiness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  backup-restore-drill:
+    name: PostgreSQL restore, integrity and legacy audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate recovery scripts and safety checks
+        run: |
+          bash -n scripts/backup-postgres.sh scripts/restore-postgres.sh scripts/verify-backup.sh scripts/audit-legacy-orders.sh scripts/verify-writer-failover.sh
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+      - name: Generate disposable CI secrets
+        run: bash scripts/init-local-env.sh
+      - name: Start ExchangeX with fresh PostgreSQL
+        run: docker compose up --build -d --wait --wait-timeout 240
+      - name: Run API and UI smoke checks
+        run: bash scripts/smoke-compose.sh
+      - name: Prove duplicate-writer rejection and fencing generation advance
+        run: bash scripts/verify-writer-failover.sh
+      - name: Check source financial invariants and legacy orders
+        run: |
+          bash scripts/audit-financial-invariants.sh
+          bash scripts/audit-legacy-orders.sh
+      - name: Perform online backup and isolated restore drill
+        run: |
+          bash scripts/backup-postgres.sh
+          archive="$(find backups -maxdepth 1 -type f -name 'exchangex_*.dump' -print -quit)"
+          test -n "$archive"
+          bash scripts/verify-backup.sh "$archive"
+      - name: Inspect Docker logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=160
+      - name: Erase disposable CI database, backups and credentials
+        if: always()
+        run: |
+          docker compose down -v --remove-orphans || true
+          rm -rf backups/*.dump backups/*.dump.sha256 .env

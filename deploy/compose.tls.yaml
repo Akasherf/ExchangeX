@@ -1,0 +1,25 @@
+# Opt-in HTTPS/WSS edge; launch with:
+# docker compose -f compose.yaml -f deploy/compose.tls.yaml up -d --build --wait
+# Keep the API, database, metrics and Grafana behind loopback/internal networks.
+services:
+  api:
+    environment:
+      EXCHANGEX_STREAM_ALLOWED_ORIGINS: https://${EXCHANGEX_DOMAIN:?Set DNS name in environment}
+  caddy:
+    image: caddy:2.11.9
+    restart: unless-stopped
+    environment:
+      EXCHANGEX_DOMAIN: ${EXCHANGEX_DOMAIN:?Set DNS name in environment}
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [frontend]
+    depends_on: [web]
+volumes:
+  caddy_data: {}
+  caddy_config: {}

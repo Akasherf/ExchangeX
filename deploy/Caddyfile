@@ -1,0 +1,12 @@
+# Public HTTPS/WSS entry point. Set EXCHANGEX_DOMAIN to a DNS name pointing here.
+{$EXCHANGEX_DOMAIN} {
+    encode zstd gzip
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        Strict-Transport-Security "max-age=31536000"
+        -Server
+    }
+    reverse_proxy web:8080
+}
