@@ -94,6 +94,12 @@ public class SymbolCoordinatorRegistry {
         return worker;
     }
 
+    /** Reports the real worker state for readiness and fail-stop supervision. */
+    public synchronized boolean allWorkersRunning() {
+        if (!started || !primary.isRunning()) return false;
+        return other.values().stream().allMatch(DurableCommandCoordinator::isRunning);
+    }
+
     @PreDestroy
     public synchronized void close() {
         other.values().forEach(DurableCommandCoordinator::close);
