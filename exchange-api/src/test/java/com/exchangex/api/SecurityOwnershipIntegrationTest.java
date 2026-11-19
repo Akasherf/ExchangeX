@@ -26,7 +26,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @ActiveProfiles("postgres-integration")
 @SpringBootTest(classes = ExchangeApiApplication.class,
         properties = {"coordinator.auto-initialize=false", "spring.flyway.enabled=false",
-                "exchangex.security.enabled=true", "EXCHANGEX_JWT_SECRET_BASE64=VEVTVF9LRVlfT05MWV9FWENIQU5HRVhfMzJfQllURVNfMDE="})
+                "exchangex.security.enabled=true", "management.endpoint.health.probes.enabled=true", "EXCHANGEX_JWT_SECRET_BASE64=VEVTVF9LRVlfT05MWV9FWENIQU5HRVhfMzJfQllURVNfMDE="})
 @AutoConfigureMockMvc
 @EnabledIfEnvironmentVariable(named = "EXCHANGEX_TEST_DB_URL", matches = ".*exchangex_test.*")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_EACH_TEST_METHOD)
@@ -67,6 +67,14 @@ class SecurityOwnershipIntegrationTest {
     }
 
     record AccountCredentials(String email, String password) {}
+
+    @Test
+    void readinessProbeAllowsAnonymousAccessButOrdersStayProtected() throws Exception {
+        mvc.perform(get("/actuator/health/readiness"))
+                .andExpect(status().isOk());
+        mvc.perform(get("/api/v1/orders/123"))
+                .andExpect(status().isUnauthorized());
+    }
 
     @Test
     void anonymousOrderEndpointsRequireAuthentication() throws Exception {
