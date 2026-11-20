@@ -1,5 +1,6 @@
 package com.exchangex.api.observability;
 
+import com.exchangex.api.SymbolCoordinatorRegistry;
 import com.exchangex.api.repository.CheckpointRepository;
 import com.exchangex.api.repository.CommandRepository;
 import org.springframework.boot.health.contributor.Health;
@@ -28,6 +29,7 @@ public class CoordinatorHealthIndicator implements HealthIndicator {
     private final CommandRepository commandRepository;
     private final CheckpointRepository checkpointRepository;
     private final JdbcTemplate jdbcTemplate;
+    private final org.springframework.beans.factory.ObjectProvider<SymbolCoordinatorRegistry> coordinators;
 
     private volatile Instant lastHealthCheck = Instant.EPOCH;
     private volatile Health lastHealth = Health.unknown().build();
@@ -37,10 +39,12 @@ public class CoordinatorHealthIndicator implements HealthIndicator {
 
     public CoordinatorHealthIndicator(CommandRepository commandRepository,
                                       CheckpointRepository checkpointRepository,
-                                      JdbcTemplate jdbcTemplate) {
+                                      JdbcTemplate jdbcTemplate,
+                                      org.springframework.beans.factory.ObjectProvider<SymbolCoordinatorRegistry> coordinators) {
         this.commandRepository = commandRepository;
         this.checkpointRepository = checkpointRepository;
         this.jdbcTemplate = jdbcTemplate;
+        this.coordinators = coordinators;
     }
 
     public Health health() {
@@ -53,6 +57,13 @@ public class CoordinatorHealthIndicator implements HealthIndicator {
             // Check database connectivity
             jdbcTemplate.queryForObject("SELECT 1", Integer.class);
 
+            SymbolCoordinatorRegistry registry = coordinators.getIfAvailable();
+            if (registry != null && !registry.allWorkersRunning()) {
+                lastHealth = Health.down().withDetail("coordinator", "STOPPED").build();
+                lastHealthCheck = now;
+                return lastHealth;
+            }
+
             // Durable state comes from PostgreSQL, not from unconnected counters.
             // We do not claim the coordinator is active: this indicator does not
             // have an authoritative coordinator lifecycle signal.
@@ -61,7 +72,7 @@ public class CoordinatorHealthIndicator implements HealthIndicator {
 
             lastHealth = Health.up()
                     .withDetail("database", "UP")
-                    .withDetail("coordinator", "UNOBSERVED")
+                    .withDetail("coordinator", registry == null ? "UNOBSERVED" : "RUNNING")
                     .withDetail("backlog", outstanding)
                     .withDetail("pendingCommands", outstanding)
                     .withDetail("lastCheckpointSequenceId", checkpoint)

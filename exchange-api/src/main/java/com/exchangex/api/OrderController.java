@@ -120,6 +120,11 @@ public class OrderController {
                         return ResponseEntity.badRequest()
                                 .body(new OrderSubmissionResponse("AMOUNT_OVERFLOW", 0));
                     }
+                    if (cause instanceof DurableCommandCoordinator.CoordinatorUnavailableException) {
+                        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                                .header("Retry-After", "2")
+                                .body(new OrderSubmissionResponse("COORDINATOR_UNAVAILABLE", 0));
+                    }
                     if (cause instanceof RejectedExecutionException) {
                         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
                                 .header("Retry-After", "1")
@@ -175,6 +180,11 @@ public class OrderController {
                     if (cause instanceof IllegalArgumentException iae) {
                         return ResponseEntity.status(HttpStatus.NOT_FOUND)
                                 .body(new CancelResponse("NOT_FOUND: " + iae.getMessage()));
+                    }
+                    if (cause instanceof DurableCommandCoordinator.CoordinatorUnavailableException) {
+                        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                                .header("Retry-After", "2")
+                                .body(new CancelResponse("COORDINATOR_UNAVAILABLE"));
                     }
                     if (cause instanceof RejectedExecutionException) {
                         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)

@@ -668,7 +668,7 @@ public class DurableCommandCoordinator implements AutoCloseable {
 
     private void ensureAcceptingCommands() {
         if (!running.get()) {
-            throw new RejectedExecutionException("Coordinator not accepting commands");
+            throw new CoordinatorUnavailableException("Coordinator not accepting commands");
         }
     }
 
@@ -795,6 +795,11 @@ public class DurableCommandCoordinator implements AutoCloseable {
         if (owners.isEmpty() || owners.get(0) != userId) {
             throw new SecurityException("Order not found");
         }
+    }
+
+    /** False if processing stopped, irrespective of HTTP/data-source health. */
+    public boolean isRunning() {
+        return running.get();
     }
 
     // Public API for controller
@@ -935,6 +940,11 @@ public class DurableCommandCoordinator implements AutoCloseable {
         OrderUpdate(long clientOrderId, long remainingQuantity, String executionStatus, long sequenceId) {
             this(clientOrderId, remainingQuantity, executionStatus);
         }
+    }
+
+    /** Distinguishes stopped matching workers from ordinary admission backpressure. */
+    public static final class CoordinatorUnavailableException extends RejectedExecutionException {
+        public CoordinatorUnavailableException(String message) { super(message); }
     }
 
     public record AdmissionResult(long sequenceId, boolean isDuplicate) {}

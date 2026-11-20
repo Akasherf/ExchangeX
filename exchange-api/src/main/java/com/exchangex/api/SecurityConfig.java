@@ -53,7 +53,7 @@ public class SecurityConfig {
                     .requestMatchers(HttpMethod.GET, "/ws", "/ws/**", "/api/v1/market/**").permitAll()
                     .requestMatchers(HttpMethod.GET, "/api/v1/orderbook/**", "/api/v1/trades",
                             "/api/v1/instruments", "/api/v1/instruments/*/trades",
-                            "/actuator/health", "/actuator/info", "/actuator/prometheus").permitAll()
+                            "/actuator/health", "/actuator/health/**", "/actuator/info", "/actuator/prometheus").permitAll()
                     .anyRequest().authenticated())
                 .oauth2ResourceServer(o -> o.jwt(Customizer.withDefaults()));
         } else {
