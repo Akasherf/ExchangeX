@@ -1,3 +1,5 @@
+> **Archived milestone document:** This records the implementation process at that point in ExchangeX's development. Commands and limitations may be outdated; use the repository-root `README.md`, current `compose.yaml`, and `docs/releases/` for current behavior and release verification.
+
 # ExchangeX Sprint 6 — Docker, CI and Observability
 
 This is a **local, single-node, simulation-only** deployment. It is **not a production exchange**. All endpoints are bound to localhost; TLS, image-signing, distributed writers and production secret-management remain Sprint 7 concerns.

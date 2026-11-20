@@ -1,3 +1,5 @@
+> **Archived milestone document:** This records the implementation process at that point in ExchangeX's development. Commands and limitations may be outdated; use the repository-root `README.md`, current `compose.yaml`, and `docs/releases/` for current behavior and release verification.
+
 # ExchangeX — Sprint 7A: Self-trade prevention and ledger audit
 
 ## Why this change is needed

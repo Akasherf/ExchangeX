@@ -1,3 +1,5 @@
+> **Archived milestone document:** This records the implementation process at that point in ExchangeX's development. Commands and limitations may be outdated; use the repository-root `README.md`, current `compose.yaml`, and `docs/releases/` for current behavior and release verification.
+
 # ExchangeX — Sprint 7C release and disaster-recovery runbook
 
 ExchangeX is an educational **simulated exchange**. It does not route orders to a market, custody funds, or satisfy financial-industry certification requirements. "Release-ready" means a validated portfolio deployment, not a real-money trading system.
