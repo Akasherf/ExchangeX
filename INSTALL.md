@@ -1,3 +1,5 @@
+> **Historical Sprint 2 instructions — not the current installation guide.** This document describes an early unprotected API overlay and must not be used to deploy the current authenticated, durable ExchangeX application. For current setup, use [README.md](README.md#getting-started), [compose.yaml](compose.yaml), and the [release checklist](docs/releases/v1.0.0-rc1-verification.md). Do not overwrite existing source, configuration, or PostgreSQL volumes using the commands below.
+
 # ExchangeX Sprint 2 — Spring Boot API add-on
 
 This is an **overlay**, not a replacement for your current matching-engine source/tests. Copy `pom.xml` and `exchange-api/` into your existing `~/Downloads/exchangex-sprint1/` folder. Your original tests remain intact. Back up or commit your work first.
