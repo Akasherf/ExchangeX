@@ -137,7 +137,7 @@ See [v1.0.0 release acceptance](docs/releases/v1.0.0-rc1-verification.md) for ga
 - [Matching rules](docs/matching-rules.md) · [Requirements](docs/requirements.md)
 - [Backup, recovery and operational runbook](docs/operations/RELEASE_7C.md)
 - [Release acceptance criteria](docs/releases/v1.0.0-rc1-verification.md)
-- [Archived development milestones](docs/development/) — implementation history, not current setup instructions
+- [Archived development milestones](docs/development/README_SPRINT4_ARCHIVE.md) — implementation history, not current setup instructions
 
 ## Author
 
