@@ -1,62 +1,73 @@
-> **Historical Sprint 2 instructions — not the current installation guide.** This document describes an early unprotected API overlay and must not be used to deploy the current authenticated, durable ExchangeX application. For current setup, use [README.md](README.md#getting-started), [compose.yaml](compose.yaml), and the [release checklist](docs/releases/v1.0.0-rc1-verification.md). Do not overwrite existing source, configuration, or PostgreSQL volumes using the commands below.
+# Install and run ExchangeX
 
-# ExchangeX Sprint 2 — Spring Boot API add-on
+This guide applies to the current Java 21 / Spring Boot / React / PostgreSQL / Docker Compose exchange simulator. Historical sprint patch instructions are preserved under [docs/development](docs/development/) and must not be applied to this checkout.
 
-This is an **overlay**, not a replacement for your current matching-engine source/tests. Copy `pom.xml` and `exchange-api/` into your existing `~/Downloads/exchangex-sprint1/` folder. Your original tests remain intact. Back up or commit your work first.
+## Prerequisites
 
-## REQUIRED: add read methods to existing OrderCommandProcessor.java
+- Docker Engine or Docker Desktop with Compose v2
+- Git, Bash, OpenSSL and `curl`
+- Sufficient resources for PostgreSQL, API, frontend, Prometheus and Grafana (6 GiB or more available to Docker is a useful starting point)
 
-Your matching engine has mutable in-memory collections and is single-writer only. Therefore HTTP reads MUST also pass through the same worker, not directly access the engine. Inside `OrderCommandProcessor`, add these public methods (after `cancel` is fine):
+## Start the local development/demo stack
 
-```java
-public CompletableFuture<java.util.Optional<OrderView>> find(long orderId) {
-    return execute(() -> engine.find(orderId));
-}
-
-public record BookSnapshot(
-    java.util.Optional<OrderView> bestBid,
-    java.util.Optional<OrderView> bestAsk) {}
-
-public CompletableFuture<BookSnapshot> snapshot() {
-    return execute(() -> new BookSnapshot(engine.bestBid(), engine.bestAsk()));
-}
-
-public CompletableFuture<java.util.List<Trade>> trades() {
-    return execute(engine::trades);
-}
+```bash
+git clone https://github.com/Akasherf/ExchangeX.git
+cd ExchangeX
+bash scripts/init-local-env.sh
+docker compose up --build -d --wait --wait-timeout 240
+bash scripts/smoke-compose.sh
 ```
 
-Do NOT call engine.find/bestBid/bestAsk/trades from arbitrary threads after starting the processor. The methods above serialize all reads with order writes.
+`scripts/init-local-env.sh` creates a private, randomly generated `.env` on first execution and **leaves any existing `.env` untouched**. Save credentials securely. Never commit `.env`.
 
-## Build and run
+| Service | Local address |
+| --- | --- |
+| Trading dashboard | http://127.0.0.1:8088 |
+| REST API | http://127.0.0.1:8085 |
+| Prometheus | http://127.0.0.1:9091 |
+| Grafana | http://127.0.0.1:3000 |
 
-```sh
-cd ~/Downloads/exchangex-sprint1
-mvn clean test
-mvn -pl exchange-api -am package -DskipTests
-java -jar exchange-api/target/exchange-api-0.1.0-SNAPSHOT.jar
+PostgreSQL is internal to the Compose network; the management port `9090` is not published to the host. The Compose deployment binds published services to loopback. Do not expose these interfaces to untrusted networks as-is.
+
+## Validate the running application
+
+```bash
+docker compose ps
+bash scripts/smoke-compose.sh
+bash scripts/audit-financial-invariants.sh
+curl --fail http://127.0.0.1:8085/api/v1/instruments
 ```
 
-API on http://localhost:8085. Run in a separate terminal:
+The smoke test checks container availability, UI, proxied API, internal matching-coordinator readiness, metrics, Prometheus and Grafana. The financial audit is read-only. Neither proves a complete live order lifecycle under a simulated outage.
 
-```sh
-curl -i -X POST http://localhost:8085/api/v1/orders -H 'Content-Type: application/json' -d '{"id":1,"side":"BUY","price":10000,"quantity":10}'
-curl -i -X POST http://localhost:8085/api/v1/orders -H 'Content-Type: application/json' -d '{"id":2,"side":"SELL","price":9900,"quantity":6}'
-curl -s http://localhost:8085/api/v1/orderbook/AAPL
-curl -s http://localhost:8085/api/v1/orders/1
-curl -s http://localhost:8085/api/v1/trades
-curl -i -X DELETE http://localhost:8085/api/v1/orders/1
+New accounts start with **zero simulated cash and positions**. The application deliberately has no unauthenticated funding endpoint. To exercise funded matching, use controlled disposable test fixtures and follow the security/recovery test procedures; do not insert arbitrary accounting records into existing databases.
+
+## Build and test source independently
+
+```bash
+mvn -B -ntp clean verify
+python3 scripts/check-test-reports.py
+cd exchange-web
+npm ci --no-audit --no-fund
+npm run build
 ```
 
-`price` is in **paise**, so 10000 means ₹100. Only AAPL is supported in this initial iteration. API has no auth/persistence and MUST remain local (do not expose publicly). POST returns an array of trades created by that command, not an order acknowledgement/status object. GET /orders/{id} only finds currently active/resting orders; fully filled or cancelled IDs return 404. Futures are used for serialized processing, but error codes for asynchronous failures require verification against actual Spring MVC exception resolution.
+This requires Java 21, Maven 3.9+, Node/npm and a suitable PostgreSQL integration-test database configuration on the host. GitHub Actions configures these dependencies for automated tests.
 
-## Troubleshooting
+## Logs and safe shutdown
 
-If `OrderCommandProcessor` lacks `find`, `snapshot`, or `trades`, add the methods above. If port 8085 is busy, change `exchange-api/src/main/resources/application.properties`. If Spring Boot dependencies fail to download, verify Maven internet access and version resolution. Module uses Spring Boot 4.1.2 (Java 21 compatible).
+```bash
+docker compose logs --tail=150 api
+docker compose logs --tail=150 web
+docker compose down
+```
 
-## Next engineering changes
+**Do not run `docker compose down -v`, `docker volume prune`, or delete Docker volumes to troubleshoot startup.** Those operations could destroy the persistent PostgreSQL database and monitoring state. Do not rotate the JWT key or database password in an existing `.env` casually.
 
-1. Create integration tests for the HTTP success and failure paths (MockMvc).
-2. Validate queue rejection maps to 503 under async MVC.
-3. Add command receipt/accepted status semantics and explicit error type mapping.
-4. Add instruments/other symbols, security, durable persistence and recovery in subsequent phases.
+If a Docker Maven build reports HTTP `429 Too Many Requests` from Maven Central, retry after the rate limit subsides; this is not proof that the pinned Spring Boot version is invalid.
+
+## Security and deployment boundary
+
+This Compose configuration is a **local-only simulator** setup, not a public production trading deployment. A public demo needs separate review of HTTPS/WSS, authentication, secrets, rate limits, external access, monitoring and backups. See [operations runbook](docs/operations/RELEASE_7C.md) and [release verification](docs/releases/v1.0.0-rc1-verification.md).
+
+Never perform destructive PostgreSQL outage tests against your existing live data. Use a separate uniquely named disposable Compose project with dedicated credentials and volumes.
