@@ -17,7 +17,7 @@ Java Backend Developer · B.Tech Computer Science (2026)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql&logoColor=white)
 ![Security](https://img.shields.io/badge/Security-JWT_%2B_BCrypt-374151)
 ![Build](https://img.shields.io/badge/Build-Maven-CC2222?logo=apachemaven&logoColor=white)
-![Status](https://img.shields.io/badge/Status-Sprint_4_backend_verified-228B22)
+![Status](https://img.shields.io/badge/Status-Release_verification-2563EB)
 
 **[Overview](#overview) · [Architecture](#architecture) · [Features](#implemented-features) · [Run locally](#getting-started) · [API](#rest-api-reference) · [Testing](#testing-and-verification) · [Roadmap](#current-limitations-and-planned-roadmap)**
 
@@ -25,6 +25,18 @@ Java Backend Developer · B.Tech Computer Science (2026)
 
 > [!IMPORTANT]
 > **ExchangeX is a learning and portfolio-grade exchange *simulator*.** It does **not** connect to a real stock exchange, place real trades, handle actual money, or provide brokerage services. Prices, balances, and securities are simulated. A passing test suite is not a production security or financial-systems certification.
+
+## Documentation
+
+- [Current installation and Docker deployment](#getting-started) — use the current Compose/CI workflow, not historical patch-application notes.
+- [Architecture and matching rules](docs/matching-rules.md)
+- [Requirements](docs/requirements.md)
+- [Sprint 5: WebSocket and React (historical)](docs/development/SPRINT5_SETUP.md)
+- [Sprint 6: Docker and monitoring (historical)](docs/development/SPRINT6_SETUP.md)
+- [Sprint 7A: Trading hardening (historical)](docs/development/SPRINT7_HARDENING.md)
+- [Sprint 7B: Security and reliability (historical)](docs/development/SPRINT7B_SECURITY_RELIABILITY.md)
+- [Backup and disaster-recovery runbook](docs/operations/RELEASE_7C.md)
+- [v1.0.0 release acceptance checklist](docs/releases/v1.0.0-rc1-verification.md)
 
 ## Overview
 
@@ -34,7 +46,7 @@ The project started as a pure-Java price/time-priority matching engine. Across f
 
 Rather than splitting everything into microservices prematurely, I chose a **modular monolith**: the matching rules remain a standalone Java module, while the API module owns database persistence, authentication, financial accounting, observability, and process lifecycle.
 
-**Current milestone:** Sprint 4 backend implementation. The latest full Maven run on **17 November 2026** reported **73 `exchange-api` tests passing, zero failures, zero errors, and zero skips**; the `matching-engine` module also built successfully (its preceding verified run contained 12 passing tests). The executable Spring Boot JAR was packaged successfully. A React trading interface and live WebSocket market feed are *planned*, not yet implemented in this repository snapshot.
+**Current milestone:** Multi-module exchange simulator with the Java matching engine, PostgreSQL-backed trading API, React/Vite dashboard, WebSocket streaming, Docker Compose deployment, monitoring, and CI/recovery tooling implemented. The project is undergoing evidence-based v1.0.0 release verification; passing checks do not certify production financial-system readiness. See [release verification](docs/releases/v1.0.0-rc1-verification.md) for the acceptance gates.
 
 ### Engineering problems addressed
 
@@ -832,6 +844,6 @@ ExchangeX is my personal backend engineering project, created to practice the ar
 
 **ExchangeX — Built to understand how reliable trading backends behave when requests are concurrent, transactions fail, and applications restart.**
 
-*Project status: Sprint 4 backend verified · Sprint 5 UI and real-time streaming planned*
+*Project status: release verification in progress · Java backend, React dashboard, streaming, Docker and CI implemented*
 
 </div>
